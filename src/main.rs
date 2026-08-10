@@ -51,6 +51,8 @@ const EXPLORER_DEFAULT_WIDTH: f32 = 216.0; // 200 + 16 margins
 const OUTLINE_DEFAULT_WIDTH: f32 = 208.0; // 200 + 8 margins
 const PANEL_SEPARATORS: f32 = 16.0;
 const OPTIMAL_WINDOW_HEIGHT: f32 = 750.0;
+const SIDEBAR_RESIZE_GRAB_RADIUS: f32 = 8.0;
+const CONTENT_RIGHT_RESIZE_GUTTER: i8 = 10;
 
 // Keyboard document scroll deltas are centralized so shortcut wiring and tests
 // share the same line/page behavior.
@@ -1564,7 +1566,7 @@ impl MarkdownApp {
             style.scroll_animation.points_per_second = 1500.0;
 
             // Keep sidebar separators easy to grab without making them visually heavy.
-            style.interaction.resize_grab_radius_side = 8.0;
+            style.interaction.resize_grab_radius_side = SIDEBAR_RESIZE_GRAB_RADIUS;
         });
 
         // Load persisted state
@@ -2619,149 +2621,161 @@ impl MarkdownApp {
                 }),
             )
             .show(ctx, |ui| {
-                // Expand/Collapse All buttons (only if there are nested headers)
-                let has_nested = any_header_has_children(&tab.outline_headers);
-                if has_nested {
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        let expand_btn = ui.small_button("Expand All");
-
-                        // Collect Expand All button for MCP
-                        #[cfg(feature = "mcp")]
-                        widget_data.push((
-                            "Outline: Expand All".to_string(),
-                            "button",
-                            expand_btn.rect,
-                            None,
-                        ));
-
-                        if expand_btn.clicked() {
-                            tab.collapsed_headers.clear();
-                        }
-
-                        let collapse_btn = ui.small_button("Collapse All");
-
-                        // Collect Collapse All button for MCP
-                        #[cfg(feature = "mcp")]
-                        widget_data.push((
-                            "Outline: Collapse All".to_string(),
-                            "button",
-                            collapse_btn.rect,
-                            None,
-                        ));
-
-                        if collapse_btn.clicked() {
-                            for i in 0..tab.outline_headers.len() {
-                                if header_has_children(&tab.outline_headers, i) {
-                                    tab.collapsed_headers.insert(i);
-                                }
-                            }
-                        }
-                    });
-                    ui.separator();
-                }
-                // Pre-compute the visible header indices (skip those hidden
-                // by collapsed ancestors). This lets us virtualize via
-                // show_rows, paying O(visible-on-screen) instead of
-                // O(total-headers) per frame. On a 100k-line doc with ~15k
-                // headers this is the difference between visibly laggy and
-                // smooth outline interactions.
-                let visible_indices: Vec<usize> = (0..tab.outline_headers.len())
-                    .filter(|&i| !header_is_hidden(&tab.outline_headers, i, &tab.collapsed_headers))
-                    .collect();
-                let show_fold_indicators = any_header_has_children(&tab.outline_headers);
-                // Row height: fold indicator is 20px tall, fold-indicator-less
-                // rows fall back to the standard interact_size which is
-                // typically 18–20px anyway. A small fudge keeps neighboring
-                // rows from clipping into each other.
-                let row_height = ui.spacing().interact_size.y.max(20.0);
-
-                egui::ScrollArea::vertical()
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .id_salt("outline")
-                    .show_rows(ui, row_height, visible_indices.len(), |ui, row_range| {
-                        let mut toggle_index: Option<usize> = None;
-                        for &idx in &visible_indices[row_range] {
-                            let header = &tab.outline_headers[idx];
-
-                            let has_children = header_has_children(&tab.outline_headers, idx);
-                            let is_collapsed = tab.collapsed_headers.contains(&idx);
-
-                            // Indent based on header level (h2 = 0, h3 = 1 indent, etc.)
-                            let indent = (header.level.saturating_sub(2) as usize) * 12;
-
+                egui::ScrollArea::horizontal()
+                    .id_salt("outline_horizontal")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Expand/Collapse All buttons (only if there are nested headers)
+                        let has_nested = any_header_has_children(&tab.outline_headers);
+                        if has_nested {
                             ui.horizontal(|ui| {
-                                // Add base indent
-                                if indent > 0 {
-                                    ui.add_space(indent as f32);
+                                ui.add_space(6.0);
+                                let expand_btn = ui.small_button("Expand All");
+
+                                // Collect Expand All button for MCP
+                                #[cfg(feature = "mcp")]
+                                widget_data.push((
+                                    "Outline: Expand All".to_string(),
+                                    "button",
+                                    expand_btn.rect,
+                                    None,
+                                ));
+
+                                if expand_btn.clicked() {
+                                    tab.collapsed_headers.clear();
                                 }
 
-                                // Fold indicator (fixed width area for alignment)
-                                // Only allocate space if any header has children
-                                if show_fold_indicators {
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(20.0, 20.0),
-                                        egui::Sense::click(),
-                                    );
-                                    if has_children {
-                                        let indicator = if is_collapsed { "+" } else { "-" };
-                                        let text_color = if response.hovered() {
-                                            ui.visuals().strong_text_color()
-                                        } else {
-                                            ui.visuals().text_color()
-                                        };
-                                        ui.painter().text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            indicator,
-                                            egui::FontId::monospace(16.0),
-                                            text_color,
-                                        );
+                                let collapse_btn = ui.small_button("Collapse All");
 
-                                        // Collect fold indicator for MCP
-                                        #[cfg(feature = "mcp")]
-                                        widget_data.push((
-                                            format!("Toggle: {}", header.title),
-                                            "button",
-                                            rect,
-                                            Some(if is_collapsed {
-                                                "collapsed".to_string()
-                                            } else {
-                                                "expanded".to_string()
-                                            }),
-                                        ));
+                                // Collect Collapse All button for MCP
+                                #[cfg(feature = "mcp")]
+                                widget_data.push((
+                                    "Outline: Collapse All".to_string(),
+                                    "button",
+                                    collapse_btn.rect,
+                                    None,
+                                ));
 
-                                        if !is_dragging && response.clicked() {
-                                            toggle_index = Some(idx);
+                                if collapse_btn.clicked() {
+                                    for i in 0..tab.outline_headers.len() {
+                                        if header_has_children(&tab.outline_headers, i) {
+                                            tab.collapsed_headers.insert(i);
                                         }
                                     }
                                 }
+                            });
+                            ui.separator();
+                        }
+                        // Pre-compute the visible header indices (skip those hidden
+                        // by collapsed ancestors). This lets us virtualize via
+                        // show_rows, paying O(visible-on-screen) instead of
+                        // O(total-headers) per frame. On a 100k-line doc with ~15k
+                        // headers this is the difference between visibly laggy and
+                        // smooth outline interactions.
+                        let visible_indices: Vec<usize> = (0..tab.outline_headers.len())
+                            .filter(|&i| {
+                                !header_is_hidden(&tab.outline_headers, i, &tab.collapsed_headers)
+                            })
+                            .collect();
+                        let show_fold_indicators = any_header_has_children(&tab.outline_headers);
+                        // Row height: fold indicator is 20px tall, fold-indicator-less
+                        // rows fall back to the standard interact_size which is
+                        // typically 18–20px anyway. A small fudge keeps neighboring
+                        // rows from clipping into each other.
+                        let row_height = ui.spacing().interact_size.y.max(20.0);
 
-                                // Header title (pre-computed truncation)
-                                let response = ui.selectable_label(false, &header.display_title);
+                        egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .id_salt("outline")
+                            .show_rows(ui, row_height, visible_indices.len(), |ui, row_range| {
+                                let mut toggle_index: Option<usize> = None;
+                                for &idx in &visible_indices[row_range] {
+                                    let header = &tab.outline_headers[idx];
 
-                                // Collect header for MCP
-                                #[cfg(feature = "mcp")]
-                                widget_data.push((
-                                    format!("Header: {}", header.title),
-                                    "header",
-                                    response.rect,
-                                    Some(format!("h{}", header.level)),
-                                ));
+                                    let has_children =
+                                        header_has_children(&tab.outline_headers, idx);
+                                    let is_collapsed = tab.collapsed_headers.contains(&idx);
 
-                                if !is_dragging && response.clicked() {
-                                    clicked_header_index = Some(idx);
+                                    // Indent based on header level (h2 = 0, h3 = 1 indent, etc.)
+                                    let indent = (header.level.saturating_sub(2) as usize) * 12;
+
+                                    ui.horizontal(|ui| {
+                                        // Add base indent
+                                        if indent > 0 {
+                                            ui.add_space(indent as f32);
+                                        }
+
+                                        // Fold indicator (fixed width area for alignment)
+                                        // Only allocate space if any header has children
+                                        if show_fold_indicators {
+                                            let (rect, response) = ui.allocate_exact_size(
+                                                egui::vec2(20.0, 20.0),
+                                                egui::Sense::click(),
+                                            );
+                                            if has_children {
+                                                let indicator =
+                                                    if is_collapsed { "+" } else { "-" };
+                                                let text_color = if response.hovered() {
+                                                    ui.visuals().strong_text_color()
+                                                } else {
+                                                    ui.visuals().text_color()
+                                                };
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    indicator,
+                                                    egui::FontId::monospace(16.0),
+                                                    text_color,
+                                                );
+
+                                                // Collect fold indicator for MCP
+                                                #[cfg(feature = "mcp")]
+                                                widget_data.push((
+                                                    format!("Toggle: {}", header.title),
+                                                    "button",
+                                                    rect,
+                                                    Some(if is_collapsed {
+                                                        "collapsed".to_string()
+                                                    } else {
+                                                        "expanded".to_string()
+                                                    }),
+                                                ));
+
+                                                if !is_dragging && response.clicked() {
+                                                    toggle_index = Some(idx);
+                                                }
+                                            }
+                                        }
+
+                                        // Header title (pre-computed truncation)
+                                        let response =
+                                            ui.selectable_label(false, &header.display_title);
+
+                                        // Collect header for MCP
+                                        #[cfg(feature = "mcp")]
+                                        widget_data.push((
+                                            format!("Header: {}", header.title),
+                                            "header",
+                                            response.rect,
+                                            Some(format!("h{}", header.level)),
+                                        ));
+
+                                        if !is_dragging && response.clicked() {
+                                            clicked_header_index = Some(idx);
+                                        }
+                                    });
+                                }
+                                // Apply toggle after iteration to avoid borrow issues
+                                if let Some(idx) = toggle_index {
+                                    if tab.collapsed_headers.contains(&idx) {
+                                        tab.collapsed_headers.remove(&idx);
+                                    } else {
+                                        tab.collapsed_headers.insert(idx);
+                                    }
                                 }
                             });
-                        }
-                        // Apply toggle after iteration to avoid borrow issues
-                        if let Some(idx) = toggle_index {
-                            if tab.collapsed_headers.contains(&idx) {
-                                tab.collapsed_headers.remove(&idx);
-                            } else {
-                                tab.collapsed_headers.insert(idx);
-                            }
-                        }
                     });
             });
 
@@ -2970,7 +2984,7 @@ impl MarkdownApp {
         egui::Frame::NONE
             .inner_margin(egui::Margin {
                 left: 8,
-                right: 3,
+                right: CONTENT_RIGHT_RESIZE_GUTTER,
                 ..Default::default()
             })
             .show(ui, |ui| {
@@ -3130,130 +3144,138 @@ impl MarkdownApp {
                 }),
             )
             .show(ctx, |ui| {
-                // Header with folder name - OUTSIDE ScrollArea
-                if let Some(root) = &self.file_explorer.root {
-                    let folder_name = root
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| root.display().to_string());
-                    ui.strong(&folder_name);
-                } else {
-                    ui.strong("No folder");
-                }
+                egui::ScrollArea::horizontal()
+                    .id_salt("file_explorer_horizontal")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Header with folder name - OUTSIDE ScrollArea
+                        if let Some(root) = &self.file_explorer.root {
+                            let folder_name = root
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| root.display().to_string());
+                            ui.strong(&folder_name);
+                        } else {
+                            ui.strong("No folder");
+                        }
 
-                // Expand/collapse/refresh buttons - OUTSIDE ScrollArea
-                ui.horizontal(|ui| {
-                    let expand_btn = ui.small_button("⊞").on_hover_text("Expand all directories");
-                    #[cfg(feature = "mcp")]
-                    self.mcp_bridge.register_widget(
-                        "Explorer: Expand All",
-                        "button",
-                        &expand_btn,
-                        None,
-                    );
-                    if expand_btn.clicked() {
-                        self.file_explorer.expand_all();
-                        self.reconcile_explorer_watches();
-                    }
+                        // Expand/collapse/refresh buttons - OUTSIDE ScrollArea
+                        ui.horizontal(|ui| {
+                            let expand_btn =
+                                ui.small_button("⊞").on_hover_text("Expand all directories");
+                            #[cfg(feature = "mcp")]
+                            self.mcp_bridge.register_widget(
+                                "Explorer: Expand All",
+                                "button",
+                                &expand_btn,
+                                None,
+                            );
+                            if expand_btn.clicked() {
+                                self.file_explorer.expand_all();
+                                self.reconcile_explorer_watches();
+                            }
 
-                    let collapse_btn = ui
-                        .small_button("⊟")
-                        .on_hover_text("Collapse all directories");
-                    #[cfg(feature = "mcp")]
-                    self.mcp_bridge.register_widget(
-                        "Explorer: Collapse All",
-                        "button",
-                        &collapse_btn,
-                        None,
-                    );
-                    if collapse_btn.clicked() {
-                        self.file_explorer.collapse_all();
-                        self.reconcile_explorer_watches();
-                    }
+                            let collapse_btn = ui
+                                .small_button("⊟")
+                                .on_hover_text("Collapse all directories");
+                            #[cfg(feature = "mcp")]
+                            self.mcp_bridge.register_widget(
+                                "Explorer: Collapse All",
+                                "button",
+                                &collapse_btn,
+                                None,
+                            );
+                            if collapse_btn.clicked() {
+                                self.file_explorer.collapse_all();
+                                self.reconcile_explorer_watches();
+                            }
 
-                    if ui.small_button("↻").on_hover_text("Refresh").clicked() {
-                        self.file_explorer.refresh();
-                    }
-                });
-
-                // Sort order dropdown
-                ui.horizontal(|ui| {
-                    ui.label("Sort:");
-                    #[allow(unused_variables)]
-                    let current_label = self.file_explorer.sort_order.label();
-                    let combo_response = egui::ComboBox::from_id_salt("explorer_sort")
-                        .selected_text(self.file_explorer.sort_order.label())
-                        .show_ui(ui, |ui| {
-                            for order in [
-                                SortOrder::NameAsc,
-                                SortOrder::NameDesc,
-                                SortOrder::DateAsc,
-                                SortOrder::DateDesc,
-                            ] {
-                                let is_selected = self.file_explorer.sort_order == order;
-                                if ui.selectable_label(is_selected, order.label()).clicked() {
-                                    self.file_explorer.set_sort_order(order);
-                                }
+                            if ui.small_button("↻").on_hover_text("Refresh").clicked() {
+                                self.file_explorer.refresh();
                             }
                         });
-                    #[cfg(feature = "mcp")]
-                    self.mcp_bridge.register_widget(
-                        "Explorer: Sort Order",
-                        "combobox",
-                        &combo_response.response,
-                        Some(current_label),
-                    );
-                    #[cfg(not(feature = "mcp"))]
-                    let _ = combo_response;
-                });
 
-                ui.separator();
+                        // Sort order dropdown
+                        ui.horizontal(|ui| {
+                            ui.label("Sort:");
+                            #[allow(unused_variables)]
+                            let current_label = self.file_explorer.sort_order.label();
+                            let combo_response = egui::ComboBox::from_id_salt("explorer_sort")
+                                .selected_text(self.file_explorer.sort_order.label())
+                                .show_ui(ui, |ui| {
+                                    for order in [
+                                        SortOrder::NameAsc,
+                                        SortOrder::NameDesc,
+                                        SortOrder::DateAsc,
+                                        SortOrder::DateDesc,
+                                    ] {
+                                        let is_selected = self.file_explorer.sort_order == order;
+                                        if ui.selectable_label(is_selected, order.label()).clicked()
+                                        {
+                                            self.file_explorer.set_sort_order(order);
+                                        }
+                                    }
+                                });
+                            #[cfg(feature = "mcp")]
+                            self.mcp_bridge.register_widget(
+                                "Explorer: Sort Order",
+                                "combobox",
+                                &combo_response.response,
+                                Some(current_label),
+                            );
+                            #[cfg(not(feature = "mcp"))]
+                            let _ = combo_response;
+                        });
 
-                // Pre-load children for all expanded dirs to avoid mutation during render
-                for dir in self
-                    .file_explorer
-                    .expanded_dirs
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                {
-                    if self.file_explorer.get_children(&dir).is_none() {
-                        self.file_explorer.load_children(&dir);
-                    }
-                }
+                        ui.separator();
 
-                // Take tree to iterate without cloning, then put it back
-                let tree = std::mem::take(&mut self.file_explorer.tree);
-                // Clone the small set of open tab paths (avoids borrow conflict with &mut self)
-                let open_paths = self.open_tab_paths.clone();
-
-                // File tree inside ScrollArea
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .id_salt("file_explorer")
-                    .show(ui, |ui| {
-                        for node in &tree {
-                            let node_action = self.render_tree_node(ui, node, 0, &open_paths);
-                            if node_action.file_to_open.is_some() {
-                                action.file_to_open = node_action.file_to_open;
-                            }
-                            if node_action.file_to_close.is_some() {
-                                action.file_to_close = node_action.file_to_close;
-                            }
-                            if node_action.dir_to_toggle.is_some() {
-                                action.dir_to_toggle = node_action.dir_to_toggle;
+                        // Pre-load children for all expanded dirs to avoid mutation during render
+                        for dir in self
+                            .file_explorer
+                            .expanded_dirs
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                        {
+                            if self.file_explorer.get_children(&dir).is_none() {
+                                self.file_explorer.load_children(&dir);
                             }
                         }
-                    });
 
-                // Put tree back and apply deferred toggle
-                self.file_explorer.tree = tree;
-                if let Some(ref dir_path) = action.dir_to_toggle {
-                    self.file_explorer.toggle_expanded(dir_path);
-                    // Keep the non-recursive explorer watches in sync with the
-                    // newly expanded/collapsed directory.
-                    self.reconcile_explorer_watches();
-                }
+                        // Take tree to iterate without cloning, then put it back
+                        let tree = std::mem::take(&mut self.file_explorer.tree);
+                        // Clone the small set of open tab paths (avoids borrow conflict with &mut self)
+                        let open_paths = self.open_tab_paths.clone();
+
+                        // File tree inside ScrollArea
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .id_salt("file_explorer")
+                            .show(ui, |ui| {
+                                for node in &tree {
+                                    let node_action =
+                                        self.render_tree_node(ui, node, 0, &open_paths);
+                                    if node_action.file_to_open.is_some() {
+                                        action.file_to_open = node_action.file_to_open;
+                                    }
+                                    if node_action.file_to_close.is_some() {
+                                        action.file_to_close = node_action.file_to_close;
+                                    }
+                                    if node_action.dir_to_toggle.is_some() {
+                                        action.dir_to_toggle = node_action.dir_to_toggle;
+                                    }
+                                }
+                            });
+
+                        // Put tree back and apply deferred toggle
+                        self.file_explorer.tree = tree;
+                        if let Some(ref dir_path) = action.dir_to_toggle {
+                            self.file_explorer.toggle_expanded(dir_path);
+                            // Keep the non-recursive explorer watches in sync with the
+                            // newly expanded/collapsed directory.
+                            self.reconcile_explorer_watches();
+                        }
+                    });
             });
 
         self.explorer_width = panel.response.rect.width();
