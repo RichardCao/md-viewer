@@ -86,14 +86,6 @@ fn keyboard_scroll_target(
     (current_offset + delta).clamp(0.0, max_scroll)
 }
 
-fn content_default_width(full_width_content: bool) -> Option<usize> {
-    if full_width_content {
-        None
-    } else {
-        Some(CONTENT_OPTIMAL_WIDTH as usize)
-    }
-}
-
 /// Check whether the desktop portal exposes the interface used by rfd's
 /// Linux folder picker. Calling rfd without this interface fails like a user
 /// cancellation, so checking first lets us distinguish that case and use a
@@ -365,11 +357,12 @@ struct PersistedState {
     dark_mode: Option<bool>,
     zoom_level: Option<f32>,
     show_outline: Option<bool>,
-    full_width_content: Option<bool>,
     open_tabs: Option<Vec<PathBuf>>,
     active_tab: Option<usize>,
     // File explorer state
     show_explorer: Option<bool>,
+    explorer_width: Option<f32>,
+    outline_width: Option<f32>,
     explorer_root: Option<PathBuf>,
     expanded_dirs: Option<Vec<PathBuf>>,
     explorer_sort_order: Option<SortOrder>,
@@ -1485,7 +1478,6 @@ struct MarkdownApp {
     dark_mode: bool,
     zoom_level: f32,
     show_outline: bool,
-    full_width_content: bool,
     watch_enabled: bool,
     error_message: Option<String>,
     is_dragging: bool,
@@ -1505,6 +1497,8 @@ struct MarkdownApp {
     // File explorer state
     file_explorer: FileExplorer,
     show_explorer: bool,
+    explorer_width: f32,
+    outline_width: f32,
     // Flash effect for updated files (path -> start time)
     flashing_paths: HashMap<PathBuf, Instant>,
     // True if running on virtual display (e.g., Xvfb :99) - limits frame rate
@@ -1569,8 +1563,8 @@ impl MarkdownApp {
             style.animation_time = 0.15;
             style.scroll_animation.points_per_second = 1500.0;
 
-            // Reduce resize grab radius to prevent overlap with adjacent scrollbars
-            style.interaction.resize_grab_radius_side = 2.0;
+            // Keep sidebar separators easy to grab without making them visually heavy.
+            style.interaction.resize_grab_radius_side = 8.0;
         });
 
         // Load persisted state
@@ -1584,8 +1578,15 @@ impl MarkdownApp {
             .unwrap_or_else(|| cc.egui_ctx.style().visuals.dark_mode);
         let zoom_level = persisted.zoom_level.unwrap_or(1.0).clamp(0.5, 3.0);
         let show_outline = persisted.show_outline.unwrap_or(true);
-        let full_width_content = persisted.full_width_content.unwrap_or(false);
         let show_explorer = persisted.show_explorer.unwrap_or(true);
+        let explorer_width = persisted
+            .explorer_width
+            .filter(|width| width.is_finite() && *width >= 0.0)
+            .unwrap_or(EXPLORER_DEFAULT_WIDTH);
+        let outline_width = persisted
+            .outline_width
+            .filter(|width| width.is_finite() && *width >= 0.0)
+            .unwrap_or(OUTLINE_DEFAULT_WIDTH);
 
         // Determine initial tabs
         let initial_tabs: Vec<Tab> = if let Some(ref path) = file {
@@ -1659,7 +1660,6 @@ impl MarkdownApp {
             dark_mode,
             zoom_level,
             show_outline,
-            full_width_content,
             watch_enabled: watch,
             error_message: None,
             is_dragging: false,
@@ -1671,6 +1671,8 @@ impl MarkdownApp {
             hovered_tab: None,
             file_explorer,
             show_explorer,
+            explorer_width,
+            outline_width,
             flashing_paths: HashMap::new(),
             is_virtual_display,
             egui_ctx: cc.egui_ctx.clone(),
@@ -2603,11 +2605,11 @@ impl MarkdownApp {
 
         let is_dragging = ctx.input(|i| i.pointer.any_down());
 
-        egui::SidePanel::right("outline")
+        let panel = egui::SidePanel::right("outline")
             .resizable(true)
-            .default_width(200.0)
-            .min_width(120.0)
-            .max_width(400.0)
+            .show_separator_line(true)
+            .default_width(self.outline_width)
+            .width_range(0.0..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
                     left: 8,
@@ -2762,6 +2764,8 @@ impl MarkdownApp {
                         }
                     });
             });
+
+        self.outline_width = panel.response.rect.width();
 
         // Register all collected widgets with MCP bridge
         #[cfg(feature = "mcp")]
@@ -2980,11 +2984,10 @@ impl MarkdownApp {
                 // exposes state.offset and inner_rect for the post-render
                 // selection-preserving wheel hack below.
                 let pending = tab.pending_scroll_offset.take();
-                let default_width = content_default_width(self.full_width_content);
                 let mut scroll_output = CommonMarkViewer::new()
                     .default_implicit_uri_scheme(&tab.base_uri)
                     .max_image_width(Some(800))
-                    .default_width(default_width)
+                    .default_width(None)
                     .indentation_spaces(2)
                     .use_strong_font_family(true)
                     .show_alt_text_on_hover(true)
@@ -3113,11 +3116,11 @@ impl MarkdownApp {
             return action;
         }
 
-        egui::SidePanel::left("file_explorer")
+        let panel = egui::SidePanel::left("file_explorer")
             .resizable(true)
-            .default_width(200.0)
-            .min_width(150.0)
-            .max_width(300.0)
+            .show_separator_line(true)
+            .default_width(self.explorer_width)
+            .width_range(0.0..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
                     left: 8,
@@ -3252,6 +3255,8 @@ impl MarkdownApp {
                     self.reconcile_explorer_watches();
                 }
             });
+
+        self.explorer_width = panel.response.rect.width();
 
         action
     }
@@ -3736,10 +3741,11 @@ impl eframe::App for MarkdownApp {
             dark_mode: Some(self.dark_mode),
             zoom_level: Some(self.zoom_level),
             show_outline: Some(self.show_outline),
-            full_width_content: Some(self.full_width_content),
             open_tabs: Some(self.get_open_tab_paths()),
             active_tab: Some(self.active_tab),
             show_explorer: Some(self.show_explorer),
+            explorer_width: Some(self.explorer_width),
+            outline_width: Some(self.outline_width),
             explorer_root: self.file_explorer.root.clone(),
             expanded_dirs: Some(self.file_explorer.expanded_dirs.iter().cloned().collect()),
             explorer_sort_order: Some(self.file_explorer.sort_order),
@@ -4264,24 +4270,6 @@ impl eframe::App for MarkdownApp {
                         ui.close();
                     }
 
-                    let full_width_text = if self.full_width_content {
-                        "✓ Full Width"
-                    } else {
-                        "Full Width"
-                    };
-                    let full_width_btn = ui.add(egui::Button::new(full_width_text));
-                    #[cfg(feature = "mcp")]
-                    self.mcp_bridge.register_widget(
-                        "Menu: View → Full Width",
-                        "button",
-                        &full_width_btn,
-                        Some(if self.full_width_content { "on" } else { "off" }),
-                    );
-                    if full_width_btn.clicked() {
-                        self.full_width_content = !self.full_width_content;
-                        ui.close();
-                    }
-
                     ui.separator();
 
                     let zoom_in_btn = ui.add(egui::Button::new("Zoom In").shortcut_text("Ctrl++"));
@@ -4650,16 +4638,6 @@ mod tests {
         let help = Args::command().render_long_help().to_string();
         assert!(help.contains("--foreground"));
         assert!(!help.contains("--no-detach"));
-    }
-
-    #[test]
-    fn capped_content_width_uses_optimal_width() {
-        assert_eq!(content_default_width(false), Some(600));
-    }
-
-    #[test]
-    fn full_width_content_uses_available_width() {
-        assert_eq!(content_default_width(true), None);
     }
 
     #[cfg(target_os = "linux")]
