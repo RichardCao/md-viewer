@@ -4,7 +4,7 @@
 
 | Shortcut | Action |
 |----------|--------|
-| Ctrl+T | New tab (open file dialog) |
+| Ctrl+T | Open file in new tab |
 | Ctrl+W | Close current tab |
 | Ctrl+Tab | Next tab |
 | Ctrl+Shift+Tab | Previous tab |
