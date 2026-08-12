@@ -392,8 +392,6 @@ pub fn header_position_key(normalized_title: &str, nth_with_same_text: usize) ->
 struct Header {
     level: u8,
     title: String,
-    /// Pre-computed truncated display title for outline sidebar
-    display_title: String,
     /// Pre-computed lowercase key for header position cache lookups
     normalized_title: String,
     /// Occurrence index among headers with the same `normalized_title`.
@@ -481,13 +479,11 @@ enum FileTreeNode {
     File {
         path: PathBuf,
         name: String,
-        display_name: String,
         modified: Option<std::time::SystemTime>,
     },
     Directory {
         path: PathBuf,
         name: String,
-        display_name: String,
         modified: Option<std::time::SystemTime>,
         /// None = not yet loaded, Some = loaded (may be empty)
         children: Option<Vec<FileTreeNode>>,
@@ -548,20 +544,16 @@ impl FileExplorer {
             if entry_path.is_dir() {
                 // Show all directories - let users expand what they want
                 // (Avoids O(n×m) scanning during initial directory scan)
-                let display_name = truncate_display_name(&name, 22);
                 nodes.push(FileTreeNode::Directory {
                     path: entry_path,
                     name,
-                    display_name,
                     modified,
                     children: None, // Lazy - not loaded yet
                 });
             } else if Self::is_markdown_file(&entry_path) {
-                let display_name = truncate_display_name(&name, 25);
                 nodes.push(FileTreeNode::File {
                     path: entry_path,
                     name,
-                    display_name,
                     modified,
                 });
             }
@@ -1136,7 +1128,6 @@ fn parse_headers(content: &str) -> ParsedHeaders {
         if let Some(caps) = re.captures(line) {
             let title = caps[2].trim().to_string();
             let normalized_title = title.to_lowercase();
-            let display_title = truncate_display_name(&title, 35);
             // Count prior headers with the same normalized title so each
             // duplicate gets a distinct composite cache key.
             let nth_with_same_text = all_headers
@@ -1146,7 +1137,6 @@ fn parse_headers(content: &str) -> ParsedHeaders {
             all_headers.push(Header {
                 level: caps[1].len() as u8,
                 title,
-                display_title,
                 normalized_title,
                 nth_with_same_text,
                 line_number,
@@ -2758,9 +2748,12 @@ impl MarkdownApp {
                                             }
                                         }
 
-                                        // Header title (pre-computed truncation)
-                                        let response =
-                                            ui.selectable_label(false, &header.display_title);
+                                        // Keep the full title so the outline's horizontal
+                                        // scroll area can expose every character.
+                                        let response = ui.add(
+                                            egui::Button::selectable(false, &header.title)
+                                                .wrap_mode(egui::TextWrapMode::Extend),
+                                        );
 
                                         // Collect header for MCP
                                         #[cfg(feature = "mcp")]
@@ -3325,12 +3318,7 @@ impl MarkdownApp {
         let indent = depth * 16;
 
         match node {
-            FileTreeNode::File {
-                path,
-                name,
-                display_name,
-                ..
-            } => {
+            FileTreeNode::File { path, name, .. } => {
                 // Calculate flash intensity for this file
                 let flash_intensity = self.get_flash_intensity(path);
                 let dark_mode = self.dark_mode;
@@ -3345,12 +3333,15 @@ impl MarkdownApp {
                     // Highlight if file is open in a tab
                     let is_open = open_paths.contains(path);
                     let text = if is_open {
-                        egui::RichText::new(display_name.as_str()).strong()
+                        egui::RichText::new(name.as_str()).strong()
                     } else {
-                        egui::RichText::new(display_name.as_str())
+                        egui::RichText::new(name.as_str())
                     };
 
-                    let response = ui.selectable_label(is_open, text);
+                    let response = ui.add(
+                        egui::Button::selectable(is_open, text)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
                     #[cfg(feature = "mcp")]
                     {
                         let state_value = if is_open { "open" } else { "" };
@@ -3362,10 +3353,6 @@ impl MarkdownApp {
                         );
                     }
 
-                    // Show full name on hover if truncated
-                    if display_name.len() != name.len() {
-                        response.clone().on_hover_text(name);
-                    }
                     if response.clicked() {
                         action.file_to_open = Some(path.clone());
                     }
@@ -3406,12 +3393,7 @@ impl MarkdownApp {
                     ui.ctx().debug_painter().rect_filled(rect, 4.0, flash_color);
                 }
             }
-            FileTreeNode::Directory {
-                path,
-                name,
-                display_name,
-                ..
-            } => {
+            FileTreeNode::Directory { path, name, .. } => {
                 // Calculate flash intensity for this directory
                 let flash_intensity = self.get_flash_intensity(path);
                 let dark_mode = self.dark_mode;
@@ -3443,7 +3425,8 @@ impl MarkdownApp {
                     ui.label(folder_icon);
 
                     let response = ui.add(
-                        egui::Label::new(display_name.as_str())
+                        egui::Label::new(name.as_str())
+                            .extend()
                             .selectable(false)
                             .sense(egui::Sense::click()),
                     );
@@ -3456,11 +3439,6 @@ impl MarkdownApp {
                             &response,
                             Some(state_value),
                         );
-                    }
-
-                    // Show full name on hover if truncated
-                    if display_name.len() != name.len() {
-                        response.clone().on_hover_text(name);
                     }
 
                     // Click directory name to toggle expansion
