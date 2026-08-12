@@ -424,6 +424,149 @@ fn parser_options_math(is_math_enabled: bool) -> pulldown_cmark::Options {
     }
 }
 
+/// Parse Markdown math while also accepting the LaTeX-style `\(...\)` and
+/// `\[...\]` delimiters commonly emitted by documentation tools.
+///
+/// pulldown-cmark only recognizes `$...$` and `$$...$$`. We normalize matched
+/// delimiters in ordinary Markdown text before parsing, then translate every
+/// event range back to the original source. This keeps checkbox edits, search
+/// highlights, and other source-position consumers correct. Delimiters inside
+/// code, HTML markup, link destinations, and other non-text syntax are left literal.
+fn parse_markdown_events(
+    text: &str,
+    math_enabled: bool,
+) -> Vec<(pulldown_cmark::Event<'static>, Range<usize>)> {
+    let options = parser_options_math(math_enabled);
+    if !math_enabled || (!text.contains(r"\(") && !text.contains(r"\[")) {
+        return pulldown_cmark::Parser::new_ext(text, options)
+            .into_offset_iter()
+            .map(|(event, range)| (event.into_static(), range))
+            .collect();
+    }
+
+    // A delimiter is eligible only when the ordinary Markdown parser exposes
+    // it as visible text. This naturally excludes inline/fenced code, HTML
+    // markup, link destinations, and Markdown control syntax.
+    let mut text_bytes = vec![false; text.len()];
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(text, parser_options_math(false)).into_offset_iter()
+    {
+        if matches!(event, pulldown_cmark::Event::Text(_)) {
+            text_bytes[range].fill(true);
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Delimiter {
+        Inline,
+        Display,
+    }
+
+    let bytes = text.as_bytes();
+    let eligible = |at: usize| {
+        at + 1 < bytes.len()
+            && text_bytes[at + 1]
+            && bytes[at] == b'\\'
+            // An odd preceding backslash count means this slash is escaped.
+            && {
+                let preceding = bytes[..at]
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'\\')
+                    .count();
+                preceding % 2 == 0
+            }
+    };
+
+    // Mark only complete pairs. An unmatched delimiter remains literal rather
+    // than changing how the rest of the document is parsed.
+    let mut replacements: Vec<Option<Delimiter>> = vec![None; text.len()];
+    let mut inline_open = None;
+    let mut display_open = None;
+    let mut at = 0usize;
+    while at + 1 < bytes.len() {
+        if eligible(at) {
+            match bytes[at + 1] {
+                b'(' if inline_open.is_none() && display_open.is_none() => {
+                    inline_open = Some(at);
+                    at += 2;
+                    continue;
+                }
+                b')' if display_open.is_none() => {
+                    if let Some(open) = inline_open.take() {
+                        replacements[open] = Some(Delimiter::Inline);
+                        replacements[at] = Some(Delimiter::Inline);
+                    }
+                    at += 2;
+                    continue;
+                }
+                b'[' if display_open.is_none() && inline_open.is_none() => {
+                    display_open = Some(at);
+                    at += 2;
+                    continue;
+                }
+                b']' if inline_open.is_none() => {
+                    if let Some(open) = display_open.take() {
+                        replacements[open] = Some(Delimiter::Display);
+                        replacements[at] = Some(Delimiter::Display);
+                    }
+                    at += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        at += 1;
+    }
+
+    if replacements.iter().all(Option::is_none) {
+        return pulldown_cmark::Parser::new_ext(text, options)
+            .into_offset_iter()
+            .map(|(event, range)| (event.into_static(), range))
+            .collect();
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    // normalized byte boundary -> original byte boundary
+    let mut original_boundary = Vec::with_capacity(text.len() + 1);
+    original_boundary.push(0);
+    let mut source_at = 0usize;
+    while source_at < text.len() {
+        if let Some(delimiter) = replacements[source_at] {
+            match delimiter {
+                Delimiter::Inline => {
+                    normalized.push('$');
+                    original_boundary.push(source_at + 2);
+                }
+                Delimiter::Display => {
+                    normalized.push_str("$$");
+                    original_boundary.push(source_at + 1);
+                    original_boundary.push(source_at + 2);
+                }
+            }
+            source_at += 2;
+        } else {
+            let ch = text[source_at..]
+                .chars()
+                .next()
+                .expect("source_at is a valid character boundary");
+            normalized.push(ch);
+            for byte_offset in 1..=ch.len_utf8() {
+                original_boundary.push(source_at + byte_offset);
+            }
+            source_at += ch.len_utf8();
+        }
+    }
+
+    pulldown_cmark::Parser::new_ext(&normalized, options)
+        .into_offset_iter()
+        .map(|(event, range)| {
+            let original_range = original_boundary[range.start]..original_boundary[range.end];
+            (event.into_static(), original_range)
+        })
+        .collect()
+}
+
 /// Hash the layout-affecting render context.
 ///
 /// `split_points` cache y-positions, which become invalid when anything that
@@ -597,11 +740,7 @@ impl CommonMarkViewerInternal {
         let content_hash = Self::hash_content(text);
         if cache.get_cached_events(content_hash).is_none() {
             let math_enabled = options.math_fn.is_some() || cfg!(feature = "math");
-            let owned_events: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
-                pulldown_cmark::Parser::new_ext(text, parser_options_math(math_enabled))
-                    .into_offset_iter()
-                    .map(|(event, range)| (event.into_static(), range))
-                    .collect();
+            let owned_events = parse_markdown_events(text, math_enabled);
             cache.set_cached_events(content_hash, owned_events);
         }
 
@@ -734,13 +873,7 @@ impl CommonMarkViewerInternal {
                 // (`lib.rs:566 unreachable!()`). See docs/devlog/027.
                 let math_enabled =
                     options.math_fn.is_some() || cfg!(feature = "math");
-                sc.events = pulldown_cmark::Parser::new_ext(
-                    text,
-                    parser_options_math(math_enabled),
-                )
-                .into_offset_iter()
-                .map(|(e, r)| (e.into_static(), r))
-                .collect();
+                sc.events = parse_markdown_events(text, math_enabled);
                 sc.content_version = version;
                 // Content changed — cached split_points y-coords are no
                 // longer valid for this content. Drop them so the first
@@ -2114,6 +2247,69 @@ mod tests {
             }
         }
         visible
+    }
+
+    #[test]
+    fn latex_style_math_delimiters_produce_math_events_with_original_ranges() {
+        let markdown = "before \\(x_t\\) after\n\n\\[\n\\boxed{\\operatorname{RMean}_{31}(x)}\n\\]\n";
+        let events = parse_markdown_events(markdown, true);
+
+        let (inline, inline_range) = events
+            .iter()
+            .find(|(event, _)| matches!(event, Event::InlineMath(_)))
+            .expect("inline math event");
+        assert_eq!(inline, &Event::InlineMath("x_t".into()));
+        assert_eq!(&markdown[inline_range.clone()], r"\(x_t\)");
+
+        let (display, display_range) = events
+            .iter()
+            .find(|(event, _)| matches!(event, Event::DisplayMath(_)))
+            .expect("display math event");
+        assert!(matches!(display, Event::DisplayMath(tex) if tex.contains(r"\boxed")));
+        assert_eq!(
+            &markdown[display_range.clone()],
+            "\\[\n\\boxed{\\operatorname{RMean}_{31}(x)}\n\\]"
+        );
+    }
+
+    #[test]
+    fn latex_style_math_delimiters_stay_literal_outside_plain_text() {
+        let markdown = r#"`\(inline code\)`
+
+```text
+\[block code\]
+```
+
+escaped \\(literal\\)
+"#;
+        let events = parse_markdown_events(markdown, true);
+
+        assert!(!events.iter().any(|(event, _)| matches!(
+            event,
+            Event::InlineMath(_) | Event::DisplayMath(_)
+        )));
+    }
+
+    #[test]
+    fn unmatched_latex_style_math_delimiter_stays_literal() {
+        let markdown = r"prefix \( without a close";
+        let events = parse_markdown_events(markdown, true);
+        assert!(!events.iter().any(|(event, _)| matches!(
+            event,
+            Event::InlineMath(_) | Event::DisplayMath(_)
+        )));
+    }
+
+    #[test]
+    fn latex_style_inline_math_keeps_following_source_ranges_exact() {
+        let markdown = "formula \\(x_t\\)\n\n- [ ] following task\n";
+        let events = parse_markdown_events(markdown, true);
+        let (_, marker_range) = events
+            .iter()
+            .find(|(event, _)| matches!(event, Event::TaskListMarker(false)))
+            .expect("task-list marker after normalized inline math");
+
+        assert_eq!(&markdown[marker_range.clone()], "[ ]");
     }
 
     #[test]

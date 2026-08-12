@@ -382,6 +382,29 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "math")]
+    #[test]
+    fn renders_cases_and_boxed_named_operator_formulas() {
+        let formulas = [
+            r#"r_t=\begin{cases}0, & t=0,\\ \log(m_t)-\log(m_{t-1}), & t>0.\end{cases}"#,
+            r#"\boxed{\operatorname{Amihud}_t=\operatorname{RMean}_{31}\left(\operatorname{SafeDiv}\left(|e^{r_t}-1|,D_t\right)\right)}"#,
+            r#"\boxed{\operatorname{Hasbrouck}_t=\operatorname{RMean}_{31}\left(\operatorname{SafeDiv}\left(r_t,\operatorname{sign}(r_t)\sqrt{|D_t|}\right)\right)}"#,
+        ];
+
+        for latex in formulas {
+            let rendered = render_math_formula(
+                latex,
+                false,
+                egui::Color32::BLACK,
+                egui::Color32::WHITE,
+            )
+            .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
+
+            assert!(rendered.size.x > 0.0);
+            assert!(rendered.size.y > 0.0);
+        }
+    }
+
     #[test]
     fn strong_code_keeps_monospace_font_family() {
         // Even with md-viewer's strong-font opt-in, strong inline code should
