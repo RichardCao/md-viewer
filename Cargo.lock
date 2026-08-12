@@ -3378,6 +3378,7 @@ dependencies = [
  "serde",
  "sys-locale",
  "ttf-parser",
+ "url",
 ]
 
 [[package]]
