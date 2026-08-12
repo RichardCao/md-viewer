@@ -52,6 +52,8 @@ const OUTLINE_DEFAULT_WIDTH: f32 = 208.0; // 200 + 8 margins
 const PANEL_SEPARATORS: f32 = 16.0;
 const OPTIMAL_WINDOW_HEIGHT: f32 = 750.0;
 const SIDEBAR_RESIZE_GRAB_RADIUS: f32 = 8.0;
+// Splitter hover radius (8 px) + egui clip expansion (3 px) + pixel-rounding slack.
+const EXPLORER_RIGHT_RESIZE_GUTTER: i8 = 12;
 const CONTENT_RIGHT_RESIZE_GUTTER: i8 = 10;
 
 // Keyboard document scroll deltas are centralized so shortcut wiring and tests
@@ -3145,7 +3147,9 @@ impl MarkdownApp {
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
                     left: 8,
-                    right: 8,
+                    // Keep the nested vertical scrollbar outside the splitter's
+                    // inward hover radius and the ScrollArea's expanded clip rect.
+                    right: EXPLORER_RIGHT_RESIZE_GUTTER,
                     top: 8,
                     bottom: 8,
                 }),
