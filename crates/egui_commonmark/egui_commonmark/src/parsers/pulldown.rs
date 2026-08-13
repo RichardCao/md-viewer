@@ -492,20 +492,19 @@ fn parse_markdown_events(
     }
 
     let bytes = text.as_bytes();
-    let eligible = |at: usize| {
+    let unescaped_slash = |at: usize| {
         at + 1 < bytes.len()
-            && text_bytes[at + 1]
             && bytes[at] == b'\\'
             // An odd preceding backslash count means this slash is escaped.
-            && {
-                let preceding = bytes[..at]
-                    .iter()
-                    .rev()
-                    .take_while(|&&byte| byte == b'\\')
-                    .count();
-                preceding % 2 == 0
-            }
+            && bytes[..at]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count()
+                % 2
+                == 0
     };
+    let eligible = |at: usize| unescaped_slash(at) && text_bytes[at + 1];
 
     // Mark only complete pairs. An unmatched delimiter remains literal rather
     // than changing how the rest of the document is parsed.
@@ -514,6 +513,27 @@ fn parse_markdown_events(
     let mut display_open = None;
     let mut at = 0usize;
     while at + 1 < bytes.len() {
+        // Once a visible-text opener has been accepted, find its raw closing
+        // delimiter directly. A pipe inside the formula may already have made
+        // CommonMark split the table cell, so the preliminary Markdown event
+        // map is not reliable for determining whether the closer is text.
+        if unescaped_slash(at) {
+            if bytes[at + 1] == b')' && display_open.is_none() {
+                if let Some(open) = inline_open.take() {
+                    replacements[open] = Some(Delimiter::Inline);
+                    replacements[at] = Some(Delimiter::Inline);
+                    at += 2;
+                    continue;
+                }
+            } else if bytes[at + 1] == b']' && inline_open.is_none() {
+                if let Some(open) = display_open.take() {
+                    replacements[open] = Some(Delimiter::Display);
+                    replacements[at] = Some(Delimiter::Display);
+                    at += 2;
+                    continue;
+                }
+            }
+        }
         if eligible(at) {
             match bytes[at + 1] {
                 b'(' if inline_open.is_none() && display_open.is_none() => {
@@ -521,24 +541,8 @@ fn parse_markdown_events(
                     at += 2;
                     continue;
                 }
-                b')' if display_open.is_none() => {
-                    if let Some(open) = inline_open.take() {
-                        replacements[open] = Some(Delimiter::Inline);
-                        replacements[at] = Some(Delimiter::Inline);
-                    }
-                    at += 2;
-                    continue;
-                }
                 b'[' if display_open.is_none() && inline_open.is_none() => {
                     display_open = Some(at);
-                    at += 2;
-                    continue;
-                }
-                b']' if inline_open.is_none() => {
-                    if let Some(open) = display_open.take() {
-                        replacements[open] = Some(Delimiter::Display);
-                        replacements[at] = Some(Delimiter::Display);
-                    }
                     at += 2;
                     continue;
                 }
@@ -560,8 +564,14 @@ fn parse_markdown_events(
     let mut original_boundary = Vec::with_capacity(text.len() + 1);
     original_boundary.push(0);
     let mut source_at = 0usize;
+    let mut active_math = None;
     while source_at < text.len() {
         if let Some(delimiter) = replacements[source_at] {
+            active_math = if active_math == Some(delimiter) {
+                None
+            } else {
+                Some(delimiter)
+            };
             match delimiter {
                 Delimiter::Inline => {
                     normalized.push('$');
@@ -1638,7 +1648,11 @@ impl CommonMarkViewerInternal {
                 } else {
                     #[cfg(feature = "math")]
                     {
-                        crate::render_math(ui, cache, &tex, true);
+                        if self.is_table {
+                            crate::render_math_in_table(ui, cache, &tex);
+                        } else {
+                            crate::render_math(ui, cache, &tex, true);
+                        }
                     }
                     #[cfg(not(feature = "math"))]
                     if let Some(math_fn) = options.math_fn {

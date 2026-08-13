@@ -1365,6 +1365,9 @@ fn render_math_formula(
     let latex = latex
         .replace("&#x26;", "&")
         .replace("&#38;", "&")
+        .replace("&#x7C;", "|")
+        .replace("&#x7c;", "|")
+        .replace("&#124;", "|")
         .replace("&#x3C;", "<")
         .replace("&#60;", "<")
         .replace("&#x3E;", ">")
