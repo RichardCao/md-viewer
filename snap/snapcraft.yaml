@@ -92,6 +92,8 @@ parts:
       - libx11-data
       - xkb-data
       - libfontconfig1
+      # Ensure math text has a CJK fallback even in a strict Snap sandbox.
+      - fonts-noto-cjk
       - libgtk-3-0
       - libglib2.0-0
       - libgl1

@@ -2,6 +2,30 @@
 
 All notable changes to markdown-viewer will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Keep tabs and back/forward history unchanged when a document cannot be read, and report file-open and reload failures in the existing error bar.
+- Parse explicit local links with CommonMark semantics, including reference links, nested parentheses, titles, and percent-encoded relative paths.
+- Prevent LaTeX-style delimiters from pairing across inline code, HTML, or link destinations while retaining absolute-value bars inside table formulas.
+- Include actual foreground and background colors in the math cache key and use compact placeholders for table-inline formulas.
+- Discover CJK math fallbacks without an external command, preserve locale-specific Pan-CJK faces, and stage Noto CJK in the strict Snap package.
+- Keep table, code-block, and HTML-table widget identities stable while rendering only a viewport slice, and rebuild heading/split positions when asynchronous images or diagrams change layout.
+- Stop treating every non-`:0` X11 display as virtual and sleeping on the UI thread each frame.
+
+### Performance
+
+- Restore complete-block viewport rendering after a one-time full-document bootstrap, keeping nested containers atomic.
+- Reuse a bounded formula worker pool and shared CPU cache; bound data-URL workers and caches; lazily initialize and bound MIME SVG caching.
+- Compute outline visibility in one linear pass, avoid unchanged search-range allocations, scan Explorer roots asynchronously, and refresh only affected directories.
+
+### Build and maintenance
+
+- Align the documented/toolchain minimum Rust version with the Rust 1.89 required by Typst and egui.
+- Add full-workspace CI and Rust 1.89 checks for the vendored renderer, and repair its examples, doctests, and macro tests after the fork rename/API changes.
+- Remove unused dependency configuration and resolve compiler, clippy, and deprecated-egui warnings.
+
 ## [0.1.15] - 2026-07-23
 
 ### Bug Fixes
@@ -264,4 +288,3 @@ All notable changes to markdown-viewer will be documented in this file.
 ### Ci
 
 - Add GitHub Actions for CI and releases
-

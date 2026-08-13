@@ -1,6 +1,9 @@
 # Architecture
 
-Single-file Rust desktop application (`src/main.rs`, ~1300 lines) for viewing markdown files using egui + egui_commonmark with a custom tab system.
+Rust desktop application for viewing Markdown files using egui and a vendored,
+extended egui_commonmark renderer. The application shell currently remains in
+`src/main.rs`; font discovery is isolated in `src/system_fonts.rs`, while parser,
+math, image-loading, and viewport behavior live in `crates/egui_commonmark`.
 
 ## Core Components
 
@@ -90,12 +93,18 @@ update() → check_file_changes() → reload affected tabs
            → render_tree_node() (recursive)
          → CentralPanel → render_tab_content()
            → SidePanel::right (outline, if show_outline && headers exist)
-           → ScrollArea::show_viewport → CommonMarkViewer
+           → CommonMarkViewer-owned ScrollArea
+             → full bootstrap after content/layout changes
+             → complete-block viewport slices on steady-state frames
            → check_link_hooks() → handle navigation
          → Drag-and-drop overlay
 ```
 
-Uses `show_viewport` for optimized rendering - egui clips content outside the visible area.
+The first frame after a content or layout change renders the full document and
+caches content-relative boundaries after complete top-level blocks. Subsequent
+frames use `show_viewport` and render only the visible range plus safety blocks.
+Nested lists, tables, blockquotes, and definition lists remain atomic. Async
+math completion increments a layout revision and forces a fresh bootstrap.
 
 ## Custom Tab System
 
@@ -115,10 +124,10 @@ The tab system uses a simple `Vec<Tab>` with an `active_tab` index:
 Left sidebar showing all markdown files in a hierarchical directory tree:
 - Root directory determined by: CLI file → persisted state → first open tab → cwd
 - Can be re-pointed at runtime via File → Open Folder… (`open_folder_dialog` → `FileExplorer::set_root`)
-- Recursive scanning with 10 level depth limit
+- Shallow, asynchronous root scanning with directories loaded lazily
 - Filters: .md, .markdown, .txt files only
 - Skip hidden files (starting with .)
-- Only shows directories containing markdown files
+- Shows directories and supported Markdown/text files; hidden entries are skipped
 - Sorted: directories first, then files, alphabetically
 - Toggle visibility with Ctrl+Shift+E
 - Click file to open in new tab (or focus if already open)

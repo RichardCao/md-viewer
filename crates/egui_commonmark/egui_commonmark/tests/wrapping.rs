@@ -236,9 +236,15 @@ fn deeply_nested_list_renders() {
 - L1 second
 ";
     let (rect, _) = render(md, 540.0);
-    assert!(rect.height() > 0.0, "deeply nested list rect was empty: {rect:?}");
+    assert!(
+        rect.height() > 0.0,
+        "deeply nested list rect was empty: {rect:?}"
+    );
     let rect2 = render_scrollable(md, 540.0, 200.0, None);
-    assert!(rect2.height() > 0.0, "deeply nested via scrollable empty: {rect2:?}");
+    assert!(
+        rect2.height() > 0.0,
+        "deeply nested via scrollable empty: {rect2:?}"
+    );
 }
 
 #[test]

@@ -21,6 +21,8 @@ pub struct ScrollableCache {
     /// theme is_dark). When this changes, split_points must be cleared —
     /// their y-positions are no longer valid for the new layout.
     pub layout_signature: u64,
+    /// Renderer-owned async content revision (for example completed math).
+    pub layout_revision: u64,
     /// Content height as reported by the previous frame's ScrollAreaOutput.
     pub last_content_h: f32,
     /// Content height captured at the most recent bootstrap. Subsequent
@@ -84,10 +86,14 @@ pub fn delayed_events_list_item<'e>(
     let mut depth: i32 = 1;
     let mut total_events = Vec::new();
     for (_, (event, range)) in events {
-        let is_item_start =
-            matches!(&event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::Item));
-        let is_item_end =
-            matches!(&event, pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Item));
+        let is_item_start = matches!(
+            &event,
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Item)
+        );
+        let is_item_end = matches!(
+            &event,
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Item)
+        );
         total_events.push((event, range));
         if is_item_start {
             depth += 1;
@@ -242,10 +248,7 @@ mod tests {
     /// `delayed_events_list_item`.
     fn parse_advance_past_first_item(
         md: &str,
-    ) -> (
-        Vec<(Event<'static>, std::ops::Range<usize>)>,
-        usize,
-    ) {
+    ) -> (Vec<(Event<'static>, std::ops::Range<usize>)>, usize) {
         let events: Vec<_> = Parser::new_ext(md, parser_options())
             .into_offset_iter()
             .map(|(e, r)| (e.into_static(), r))
@@ -262,19 +265,12 @@ mod tests {
     fn delayed_events_list_item_simple_item() {
         let md = "- alpha\n- beta\n";
         let (events, start) = parse_advance_past_first_item(md);
-        let mut iter = events
-            .clone()
-            .into_iter()
-            .enumerate()
-            .skip(start);
+        let mut iter = events.clone().into_iter().enumerate().skip(start);
         let collected = delayed_events_list_item(&mut iter);
         // Should contain the contents of the FIRST item and stop AT the
         // matching `TagEnd::Item` for it (inclusive).
         assert!(
-            matches!(
-                collected.last(),
-                Some((Event::End(TagEnd::Item), _))
-            ),
+            matches!(collected.last(), Some((Event::End(TagEnd::Item), _))),
             "expected last event to be TagEnd::Item, got {:?}",
             collected.last()
         );
@@ -300,11 +296,7 @@ mod tests {
 - outer-2
 ";
         let (events, start) = parse_advance_past_first_item(md);
-        let mut iter = events
-            .clone()
-            .into_iter()
-            .enumerate()
-            .skip(start);
+        let mut iter = events.clone().into_iter().enumerate().skip(start);
         let collected = delayed_events_list_item(&mut iter);
 
         // The captured slice must include the inner list's close (otherwise

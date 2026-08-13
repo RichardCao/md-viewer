@@ -1,6 +1,6 @@
-/// Simple HTML table parser for rendering `<table>` blocks as egui grids.
-/// Handles `<thead>`, `<tbody>`, `<tr>`, `<th>`, `<td>` elements.
-/// No external dependencies — string-based parsing only.
+//! Simple HTML table parser for rendering `<table>` blocks as egui grids.
+//! Handles `<thead>`, `<tbody>`, `<tr>`, `<th>`, `<td>` elements.
+//! No external dependencies — string-based parsing only.
 
 /// Parsed HTML table ready for rendering.
 pub struct HtmlTable {

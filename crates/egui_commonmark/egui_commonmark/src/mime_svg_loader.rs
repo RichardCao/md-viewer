@@ -15,9 +15,22 @@ use egui::{
 use resvg::usvg::fontdb::{Database, Family};
 
 struct MimeSvgLoader {
-    cache: Mutex<HashMap<(String, SizeHint), Result<Arc<ColorImage>, String>>>,
-    options: resvg::usvg::Options<'static>,
+    cache: Mutex<SvgCache>,
+    options: Mutex<Option<resvg::usvg::Options<'static>>>,
 }
+
+struct SvgCacheEntry {
+    result: Result<Arc<ColorImage>, String>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct SvgCache {
+    entries: HashMap<(String, SizeHint), SvgCacheEntry>,
+    use_tick: u64,
+}
+
+const MAX_SVG_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 impl MimeSvgLoader {
     const ID: &'static str = egui::generate_loader_id!(MimeSvgLoader);
@@ -25,18 +38,51 @@ impl MimeSvgLoader {
 
 impl Default for MimeSvgLoader {
     fn default() -> Self {
-        let options = resvg::usvg::Options::default();
-        #[cfg(feature = "svg_text")]
-        let options = {
-            let mut options = options;
-            options.fontdb_mut().load_system_fonts();
-            repair_sans_serif_family(options.fontdb_mut());
-            options
-        };
         Self {
             cache: Mutex::default(),
-            options,
+            // Loading the system SVG font database is relatively expensive;
+            // defer it until a MIME-only SVG is actually encountered.
+            options: Mutex::new(None),
         }
+    }
+}
+
+fn svg_options() -> resvg::usvg::Options<'static> {
+    let options = resvg::usvg::Options::default();
+    #[cfg(feature = "svg_text")]
+    let options = {
+        let mut options = options;
+        options.fontdb_mut().load_system_fonts();
+        repair_sans_serif_family(options.fontdb_mut());
+        options
+    };
+    options
+}
+
+fn svg_result_bytes(result: &Result<Arc<ColorImage>, String>) -> usize {
+    match result {
+        Ok(image) => image.pixels.len() * size_of::<egui::Color32>(),
+        Err(error) => error.len(),
+    }
+}
+
+fn trim_svg_cache(cache: &mut SvgCache) {
+    while cache
+        .entries
+        .values()
+        .map(|entry| svg_result_bytes(&entry.result))
+        .sum::<usize>()
+        > MAX_SVG_CACHE_BYTES
+    {
+        let Some(victim) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.entries.remove(&victim);
     }
 }
 
@@ -112,7 +158,16 @@ impl ImageLoader for MimeSvgLoader {
         }
 
         let key = (uri.to_owned(), size_hint);
-        if let Some(result) = self.cache.lock().get(&key).cloned() {
+        let cached = {
+            let mut cache = self.cache.lock();
+            cache.use_tick = cache.use_tick.wrapping_add(1);
+            let tick = cache.use_tick;
+            cache.entries.get_mut(&key).map(|entry| {
+                entry.last_used = tick;
+                entry.result.clone()
+            })
+        };
+        if let Some(result) = cached {
             return result
                 .map(|image| ImagePoll::Ready { image })
                 .map_err(LoadError::Loading);
@@ -121,10 +176,31 @@ impl ImageLoader for MimeSvgLoader {
         match ctx.try_load_bytes(uri)? {
             BytesPoll::Pending { size } => Ok(ImagePoll::Pending { size }),
             BytesPoll::Ready { bytes, mime, .. } if mime.as_deref().is_some_and(is_svg_mime) => {
-                let result =
-                    egui_extras::image::load_svg_bytes_with_size(&bytes, size_hint, &self.options)
-                        .map(Arc::new);
-                self.cache.lock().insert(key, result.clone());
+                let result = {
+                    let mut options = self.options.lock();
+                    let options = options.get_or_insert_with(svg_options);
+                    egui_extras::image::load_svg_bytes_with_size(&bytes, size_hint, options)
+                        .map(Arc::new)
+                };
+                let result = if svg_result_bytes(&result) > MAX_SVG_CACHE_BYTES {
+                    Err(format!(
+                        "rasterized SVG exceeds the {} MiB cache limit",
+                        MAX_SVG_CACHE_BYTES / (1024 * 1024)
+                    ))
+                } else {
+                    result
+                };
+                let mut cache = self.cache.lock();
+                cache.use_tick = cache.use_tick.wrapping_add(1);
+                let tick = cache.use_tick;
+                cache.entries.insert(
+                    key,
+                    SvgCacheEntry {
+                        result: result.clone(),
+                        last_used: tick,
+                    },
+                );
+                trim_svg_cache(&mut cache);
                 result
                     .map(|image| ImagePoll::Ready { image })
                     .map_err(LoadError::Loading)
@@ -136,21 +212,20 @@ impl ImageLoader for MimeSvgLoader {
     fn forget(&self, uri: &str) {
         self.cache
             .lock()
+            .entries
             .retain(|(cached_uri, _), _| cached_uri != uri);
     }
 
     fn forget_all(&self) {
-        self.cache.lock().clear();
+        self.cache.lock().entries.clear();
     }
 
     fn byte_size(&self) -> usize {
         self.cache
             .lock()
+            .entries
             .values()
-            .map(|result| match result {
-                Ok(image) => image.pixels.len() * size_of::<egui::Color32>(),
-                Err(error) => error.len(),
-            })
+            .map(|entry| svg_result_bytes(&entry.result))
             .sum()
     }
 }
@@ -175,12 +250,13 @@ mod tests {
 
     use egui::{
         load::{ImageLoader, SizeHint},
+        mutex::Mutex,
         Color32, ColorImage,
     };
 
     #[cfg(feature = "svg_text")]
     use super::parse_fontconfig_family;
-    use super::{is_svg_mime, MimeSvgLoader};
+    use super::{is_svg_mime, MimeSvgLoader, SvgCacheEntry};
 
     #[test]
     fn recognizes_svg_mime_with_optional_parameters() {
@@ -205,28 +281,38 @@ mod tests {
     fn forget_removes_every_cached_size_for_uri() {
         let loader = MimeSvgLoader {
             cache: Default::default(),
-            options: resvg::usvg::Options::default(),
+            options: Mutex::new(Some(resvg::usvg::Options::default())),
         };
         let image = Arc::new(ColorImage::filled([1, 1], Color32::WHITE));
 
-        loader.cache.lock().insert(
+        loader.cache.lock().entries.insert(
             ("https://example.com/badge".to_owned(), SizeHint::Width(10)),
-            Ok(image.clone()),
+            SvgCacheEntry {
+                result: Ok(image.clone()),
+                last_used: 1,
+            },
         );
-        loader.cache.lock().insert(
+        loader.cache.lock().entries.insert(
             ("https://example.com/badge".to_owned(), SizeHint::Width(20)),
-            Ok(image.clone()),
+            SvgCacheEntry {
+                result: Ok(image.clone()),
+                last_used: 2,
+            },
         );
-        loader.cache.lock().insert(
+        loader.cache.lock().entries.insert(
             ("https://example.com/other".to_owned(), SizeHint::Width(10)),
-            Ok(image),
+            SvgCacheEntry {
+                result: Ok(image),
+                last_used: 3,
+            },
         );
 
         loader.forget("https://example.com/badge");
 
         let cache = loader.cache.lock();
-        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.entries.len(), 1);
         assert!(cache
+            .entries
             .keys()
             .all(|(uri, _)| uri == "https://example.com/other"));
     }

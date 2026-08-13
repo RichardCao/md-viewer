@@ -388,6 +388,9 @@ struct DefinitionList {
 pub struct CommonMarkViewerInternal {
     curr_table: usize,
     curr_code_block: usize,
+    table_source_start: Option<usize>,
+    code_block_source_start: Option<usize>,
+    html_block_source_start: Option<usize>,
     text_style: Style,
     list: List,
     link: Option<Link>,
@@ -425,6 +428,9 @@ impl CommonMarkViewerInternal {
         Self {
             curr_table: 0,
             curr_code_block: 0,
+            table_source_start: None,
+            code_block_source_start: None,
+            html_block_source_start: None,
             text_style: Style::default(),
             list: List::default(),
             link: None,
@@ -505,6 +511,44 @@ fn parse_markdown_events(
                 == 0
     };
     let eligible = |at: usize| unescaped_slash(at) && text_bytes[at + 1];
+    let table_closer_is_plain = |open: usize, close: usize| {
+        let line_start = text[..open].rfind('\n').map_or(0, |at| at + 1);
+        let line_end = text[open..].find('\n').map_or(text.len(), |at| open + at);
+        if close >= line_end
+            || text[line_start..line_end]
+                .bytes()
+                .filter(|b| *b == b'|')
+                .count()
+                < 2
+        {
+            return false;
+        }
+
+        // The preliminary CommonMark parse may split a formula at its `|`,
+        // so its closer no longer appears as Text. Permit that table-specific
+        // case while still rejecting closers inside code, HTML, and links.
+        let mut in_code = false;
+        let mut in_html = false;
+        let mut link_depth = 0usize;
+        let line = &bytes[line_start..close];
+        let mut index = 0usize;
+        while index < line.len() {
+            match line[index] {
+                b'`' => in_code = !in_code,
+                b'<' if !in_code => in_html = true,
+                b'>' if !in_code => in_html = false,
+                b']' if !in_code && !in_html && line.get(index + 1) == Some(&b'(') => {
+                    link_depth = 1;
+                    index += 1;
+                }
+                b'(' if link_depth > 0 => link_depth += 1,
+                b')' if link_depth > 0 => link_depth -= 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        !in_code && !in_html && link_depth == 0
+    };
 
     // Mark only complete pairs. An unmatched delimiter remains literal rather
     // than changing how the rest of the document is parsed.
@@ -513,11 +557,14 @@ fn parse_markdown_events(
     let mut display_open = None;
     let mut at = 0usize;
     while at + 1 < bytes.len() {
-        // Once a visible-text opener has been accepted, find its raw closing
-        // delimiter directly. A pipe inside the formula may already have made
-        // CommonMark split the table cell, so the preliminary Markdown event
-        // map is not reliable for determining whether the closer is text.
-        if unescaped_slash(at) {
+        // Both ends must be visible Markdown text. Without this check an
+        // opener in prose could pair with a closer in inline code, HTML, or a
+        // link destination and rewrite unrelated Markdown structure.
+        let raw_inline_table_closer = inline_open
+            .is_some_and(|open| bytes[at + 1] == b')' && table_closer_is_plain(open, at));
+        let raw_display_table_closer = display_open
+            .is_some_and(|open| bytes[at + 1] == b']' && table_closer_is_plain(open, at));
+        if eligible(at) || raw_inline_table_closer || raw_display_table_closer {
             if bytes[at + 1] == b')' && display_open.is_none() {
                 if let Some(open) = inline_open.take() {
                     replacements[open] = Some(Delimiter::Inline);
@@ -595,7 +642,7 @@ fn parse_markdown_events(
                 // leave this and following formulas as raw text. An entity is
                 // invisible to table parsing and is decoded by the math backend.
                 normalized.push_str("&#124;");
-                original_boundary.extend(std::iter::repeat(source_at + 1).take(6));
+                original_boundary.extend(std::iter::repeat_n(source_at + 1, 6));
             } else {
                 normalized.push(ch);
                 for byte_offset in 1..=ch.len_utf8() {
@@ -677,8 +724,6 @@ fn is_block_end_tag(tag: &pulldown_cmark::TagEnd) -> bool {
             | TagEnd::HtmlBlock
             | TagEnd::MetadataBlock(_)
             | TagEnd::DefinitionList
-            | TagEnd::DefinitionListTitle
-            | TagEnd::DefinitionListDefinition
     )
 }
 
@@ -715,7 +760,7 @@ fn is_likely_currency(tex: &str) -> bool {
     // Relational / grouping operators that a closed `$...$` currency amount
     // never contains: `w(z)`, `f(R)`, `D>0`, `p=P`, `[-1.1,-1.0]`, `=0`.
     // Their presence means real math, not a `$5`-style misparse.
-    if trimmed.contains(|c: char| matches!(c, '=' | '<' | '>' | '(' | ')' | '[' | ']')) {
+    if trimmed.contains(['=', '<', '>', '(', ')', '[', ']']) {
         return false;
     }
 
@@ -738,7 +783,9 @@ fn is_likely_currency(tex: &str) -> bool {
     // InlineMath by spanning two `$` across prose, so its mis-parsed content
     // carries spaces or dashes (`"8.5 to "`, `"3,000–"`) — which fail this test
     // and fall through to the currency branch below.
-    if trimmed.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
         && trimmed.chars().any(|c| c.is_ascii_digit())
     {
         return false;
@@ -777,8 +824,14 @@ fn registered_auto_link_ranges(
         }
         for (start, _) in text.match_indices(destination) {
             let end = start + destination.len();
-            let left_ok = text[..start].chars().next_back().is_none_or(|ch| !is_path_char(ch));
-            let right_ok = text[end..].chars().next().is_none_or(|ch| !is_path_char(ch));
+            let left_ok = text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !is_path_char(ch));
+            let right_ok = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_path_char(ch));
             if left_ok && right_ok {
                 matches.push((start..end, destination.clone()));
             }
@@ -847,16 +900,15 @@ impl CommonMarkViewerInternal {
             ui.spacing_mut().item_spacing.x = 0.0;
             let height = ui.text_style_height(&TextStyle::Body);
             ui.set_row_height(height);
+            let content_origin_y = ui.next_widget_position().y;
 
             // Use cached events — clone the Vec reference data for iteration
             // (events are 'static so this is cheap pointer copies, not re-parsing)
-            let events_data = cache.get_cached_events(content_hash)
+            let events_data = cache
+                .get_cached_events(content_hash)
                 .expect("events just cached")
                 .to_vec();
-            let mut events = events_data
-                .into_iter()
-                .enumerate()
-                .peekable();
+            let mut events = events_data.into_iter().enumerate().peekable();
 
             while let Some((index, (e, src_span))) = events.next() {
                 let start_position = ui.next_widget_position();
@@ -903,15 +955,28 @@ impl CommonMarkViewerInternal {
                         let scroll_cache = scroll_cache(cache, &source_id);
                         let end_position = ui.next_widget_position();
 
+                        let split_index = index.saturating_add(1);
                         let split_point_exists = scroll_cache
                             .split_points
                             .iter()
-                            .any(|(i, _, _)| *i == index);
+                            .any(|(i, _, _)| *i == split_index);
 
                         if !split_point_exists {
-                            scroll_cache
-                                .split_points
-                                .push((index, start_position, end_position));
+                            let relative_start = egui::pos2(
+                                start_position.x,
+                                (start_position.y - content_origin_y).max(0.0),
+                            );
+                            let relative_end = egui::pos2(
+                                end_position.x,
+                                (end_position.y - content_origin_y).max(0.0),
+                            );
+                            // Resume after this complete block. Starting at
+                            // its End tag would omit the matching Start state.
+                            scroll_cache.split_points.push((
+                                split_index,
+                                relative_start,
+                                relative_end,
+                            ));
                         }
                     }
                 }
@@ -922,8 +987,9 @@ impl CommonMarkViewerInternal {
             }
 
             if let Some(source_id) = split_points_id {
+                let content_height = (ui.next_widget_position().y - content_origin_y).max(0.0);
                 scroll_cache(cache, &source_id).page_size =
-                    Some(ui.next_widget_position().to_vec2());
+                    Some(egui::vec2(max_width, content_height));
             }
         });
 
@@ -945,6 +1011,7 @@ impl CommonMarkViewerInternal {
         let available_size = ui.available_size();
         let scroll_id = source_id.with("_scroll_area");
         let layout_sig = compute_layout_signature(ui, options);
+        let layout_revision = cache.layout_revision();
 
         // Ensure parsed events are cached on the ScrollableCache, keyed by a
         // content version. The caller can provide a monotonic version (bumped
@@ -953,11 +1020,11 @@ impl CommonMarkViewerInternal {
         // The big win either way is avoiding pulldown_cmark::Parser::new_ext +
         // collect on every frame (~52 ms at 100k lines).
         let version = content_version.unwrap_or_else(|| Self::hash_content(text));
-        let mut content_changed = false;
+        let mut layout_invalidated = false;
         {
             let sc = scroll_cache(cache, &source_id);
             if sc.events.is_empty() || sc.content_version != version {
-                content_changed = true;
+                layout_invalidated = true;
                 // Must mirror `show()`'s `math_enabled` derivation
                 // (parsers/pulldown.rs in this file: `options.math_fn.is_some()
                 // || cfg!(feature = "math")`). The bootstrap branch below
@@ -970,8 +1037,7 @@ impl CommonMarkViewerInternal {
                 // iteration at an unrelated event — often `Tag::Item` with no
                 // matching `Tag::List` start → `List::start_item` panics
                 // (`lib.rs:566 unreachable!()`). See docs/devlog/027.
-                let math_enabled =
-                    options.math_fn.is_some() || cfg!(feature = "math");
+                let math_enabled = options.math_fn.is_some() || cfg!(feature = "math");
                 sc.events = parse_markdown_events(text, math_enabled);
                 sc.content_version = version;
                 // Content changed — cached split_points y-coords are no
@@ -983,10 +1049,17 @@ impl CommonMarkViewerInternal {
             // Width/zoom/theme change: y-coordinates are invalid for the
             // new layout, even though parsed events are still good.
             if sc.layout_signature != layout_sig {
+                layout_invalidated = true;
                 sc.layout_signature = layout_sig;
                 sc.page_size = None;
                 sc.split_points.clear();
                 sc.available_size = available_size;
+            }
+            if sc.layout_revision != layout_revision {
+                layout_invalidated = true;
+                sc.layout_revision = layout_revision;
+                sc.page_size = None;
+                sc.split_points.clear();
             }
             // When the caller wants to jump to a specific scroll position
             // (outline click, search-jump), we must paint *every* event
@@ -1028,6 +1101,7 @@ impl CommonMarkViewerInternal {
             if sc.bootstrap_content_h > 0.0
                 && (sc.last_content_h - sc.bootstrap_content_h).abs() > CONTENT_H_DRIFT_THRESHOLD
             {
+                layout_invalidated = true;
                 sc.page_size = None;
                 sc.split_points.clear();
             }
@@ -1035,7 +1109,7 @@ impl CommonMarkViewerInternal {
         // Header positions are content-keyed; new content means the cached
         // y values point at the wrong headings. Done outside the `sc` borrow
         // scope above so `cache` is reborrowable.
-        if content_changed {
+        if layout_invalidated {
             cache.clear_header_positions();
         }
 
@@ -1053,19 +1127,10 @@ impl CommonMarkViewerInternal {
             sa
         };
 
-        // FORCE BOOTSTRAP EVERY FRAME: disable viewport-virtualization until
-        // the skip-paint slicing bugs are fully resolved (see
-        // docs/devlog/030-skip-paint-investigation.md for the design plan).
-        // The slice path renders events without their preceding container
-        // context (Start tags before the slice are missing), producing
-        // layout differences vs bootstrap — visible as flicker, wrong
-        // spacing, and shifted indents during scroll. Bootstrap renders
-        // the full document each frame; measured on T470 (i5-7200U, 2c):
-        // 1.2 ms / 348 events, 5.7 ms / 2514 events, 39 ms / 20k events,
-        // 229 ms / 100k events. Acceptable up to ~10k events; degraded
-        // above. The skip-paint code below is kept as `unreachable!`
-        // so future restoration can drop the early return.
-        {
+        // Bootstrap once after content/layout invalidation. It records safe
+        // top-level block boundaries and content-relative positions. Normal
+        // frames then paint only the viewport slice between clean boundaries.
+        if scroll_cache(cache, &source_id).page_size.is_none() {
             let out = make_scroll_area().show(ui, |ui| {
                 cache.set_scroll_offset(pending_scroll_offset.unwrap_or(0.0));
                 self.show(ui, cache, options, text, Some(source_id));
@@ -1076,123 +1141,107 @@ impl CommonMarkViewerInternal {
             sc.bootstrap_content_h = out.content_size.y;
             return out;
         }
-        // Kept for future restoration once skip-paint is bug-free.
-        #[allow(unreachable_code)]
         let page_size_opt = scroll_cache(cache, &source_id).page_size;
-        #[allow(unreachable_code)]
         let Some(page_size) = page_size_opt else {
             unreachable!()
         };
 
         let num_rows = scroll_cache(cache, &source_id).events.len();
 
-        let out = make_scroll_area()
-            .show_viewport(ui, |ui, viewport| {
-                ui.set_height(page_size.y);
-                // ui.cursor().top() inside show_viewport is viewport-relative;
-                // record_header_position and record_active_search_y_viewport
-                // add this offset to recover content-relative y.
-                cache.set_scroll_offset(viewport.min.y);
-                let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+        let out = make_scroll_area().show_viewport(ui, |ui, viewport| {
+            ui.set_height(page_size.y);
+            // ui.cursor().top() inside show_viewport is viewport-relative;
+            // record_header_position and record_active_search_y_viewport
+            // add this offset to recover content-relative y.
+            cache.set_scroll_offset(viewport.min.y);
+            let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
 
-                let max_width = options.max_width(ui);
-                ui.allocate_ui_with_layout(egui::vec2(max_width, 0.0), layout, |ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let scroll_cache = scroll_cache(cache, &source_id);
+            let max_width = options.max_width(ui);
+            ui.allocate_ui_with_layout(egui::vec2(max_width, 0.0), layout, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let scroll_cache = scroll_cache(cache, &source_id);
 
-                    // split_points are populated in event order, which matches
-                    // top-to-bottom layout order, so y-coords are monotonic
-                    // non-decreasing. Binary-search instead of linear filter:
-                    // O(log N) vs the old O(N) at 15k+ split points (100k-line doc).
+                // split_points are populated in event order, which matches
+                // top-to-bottom layout order, so y-coords are monotonic
+                // non-decreasing. Binary-search instead of linear filter:
+                // O(log N) vs the old O(N) at 15k+ split points (100k-line doc).
 
-                    // First waypoint: the second-to-last split point whose
-                    // end.y is still above the viewport. Picking "second-to-last"
-                    // gives us a safety frame above the viewport top to avoid
-                    // clipping inline-flow content that started just above.
-                    let above = scroll_cache
-                        .split_points
-                        .partition_point(|(_, _, end)| end.y < viewport.min.y);
-                    let (first_event_index, _, first_end_position) = if above >= 2 {
-                        scroll_cache.split_points[above - 2]
+                // First waypoint: the second-to-last split point whose
+                // end.y is still above the viewport. Picking "second-to-last"
+                // gives us a safety frame above the viewport top to avoid
+                // clipping inline-flow content that started just above.
+                let above = scroll_cache
+                    .split_points
+                    .partition_point(|(_, _, end)| end.y < viewport.min.y);
+                let (first_event_index, _, first_end_position) = if above >= 2 {
+                    scroll_cache.split_points[above - 2]
+                } else {
+                    (0, Pos2::ZERO, Pos2::ZERO)
+                };
+
+                // Last waypoint: the second split point whose start.y is
+                // strictly below the viewport bottom. Same safety idea on
+                // the bottom edge.
+                let below = scroll_cache
+                    .split_points
+                    .partition_point(|(_, start, _)| start.y <= viewport.max.y);
+                let last_event_index = scroll_cache
+                    .split_points
+                    .get(below + 1)
+                    .map(|(index, _, _)| *index)
+                    .unwrap_or(num_rows);
+
+                // Clone only the events we'll actually iterate this frame
+                // — the visible viewport plus safety margins above/below.
+                // The previous implementation cloned the full Vec (~1.5 ms
+                // at 30k events on Recent-Changes.md), then `skip`ed all
+                // but ~150 events. This trims the clone to the actual
+                // range used, dropping per-frame allocation churn from
+                // ~1.5 ms to ~10 µs on the same doc. The slice clone is
+                // released before `process_event` mutably re-borrows the
+                // cache for syntect/header state — NLL covers this.
+                let range_end = last_event_index.min(scroll_cache.events.len());
+                let events_range: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
+                    if first_event_index < range_end {
+                        scroll_cache.events[first_event_index..range_end].to_vec()
                     } else {
-                        (0, Pos2::ZERO, Pos2::ZERO)
+                        Vec::new()
                     };
 
-                    // Last waypoint: the second split point whose start.y is
-                    // strictly below the viewport bottom. Same safety idea on
-                    // the bottom edge.
-                    let below = scroll_cache
-                        .split_points
-                        .partition_point(|(_, start, _)| start.y <= viewport.max.y);
-                    let last_event_index = scroll_cache
-                        .split_points
-                        .get(below + 1)
-                        .map(|(index, _, _)| *index)
-                        .unwrap_or(num_rows);
+                // Advance cursor VERTICALLY by first_end_position.y to
+                // position events at the right viewport y. `to_vec2()`
+                // would also pass first_end_position.x as allocation
+                // width — that's the X-cursor where the previous block
+                // ended (often a non-zero left margin or a list-indent
+                // depth). In `left_to_right(BOTTOM).with_main_wrap`,
+                // allocate_space consumes that as width-advance,
+                // shifting subsequent events right and breaking
+                // indentation of code blocks, tables, and text.
+                ui.allocate_space(egui::vec2(0.0, first_end_position.y));
 
-                    // Clone only the events we'll actually iterate this frame
-                    // — the visible viewport plus safety margins above/below.
-                    // The previous implementation cloned the full Vec (~1.5 ms
-                    // at 30k events on Recent-Changes.md), then `skip`ed all
-                    // but ~150 events. This trims the clone to the actual
-                    // range used, dropping per-frame allocation churn from
-                    // ~1.5 ms to ~10 µs on the same doc. The slice clone is
-                    // released before `process_event` mutably re-borrows the
-                    // cache for syntect/header state — NLL covers this.
-                    let range_end = last_event_index.min(scroll_cache.events.len());
-                    let events_range: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
-                        if first_event_index < range_end {
-                            scroll_cache.events[first_event_index..range_end].to_vec()
-                        } else {
-                            Vec::new()
-                        };
+                // Re-attach original indices via map so peekable iteration
+                // and downstream consumers still see the absolute event
+                // index (used by `if i == 0 { ... }` below for the
+                // bootstrap-newline gate).
+                let mut events = events_range
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, ev)| (offset + first_event_index, ev))
+                    .peekable();
 
-                    let last_sp_y_used = scroll_cache
-                        .split_points
-                        .get(below + 1)
-                        .map(|p| p.2.y)
-                        .unwrap_or(0.0);
-                    eprintln!(
-                        "[SKIP] vp=[{:.0},{:.0}] evt=[{},{}]/{} sp_y=[{:.0},{:.0}] a={} b={}",
-                        viewport.min.y, viewport.max.y,
-                        first_event_index, last_event_index, num_rows,
-                        first_end_position.y, last_sp_y_used,
-                        above, below
-                    );
-                    // Advance cursor VERTICALLY by first_end_position.y to
-                    // position events at the right viewport y. `to_vec2()`
-                    // would also pass first_end_position.x as allocation
-                    // width — that's the X-cursor where the previous block
-                    // ended (often a non-zero left margin or a list-indent
-                    // depth). In `left_to_right(BOTTOM).with_main_wrap`,
-                    // allocate_space consumes that as width-advance,
-                    // shifting subsequent events right and breaking
-                    // indentation of code blocks, tables, and text.
-                    ui.allocate_space(egui::vec2(0.0, first_end_position.y));
-
-                    // Re-attach original indices via map so peekable iteration
-                    // and downstream consumers still see the absolute event
-                    // index (used by `if i == 0 { ... }` below for the
-                    // bootstrap-newline gate).
-                    let mut events = events_range
-                        .into_iter()
-                        .enumerate()
-                        .map(|(offset, ev)| (offset + first_event_index, ev))
-                        .peekable();
-
-                    while let Some((i, (e, src_span))) = events.next() {
-                        if events.peek().is_none() {
-                            self.line.should_end_newline_forced = false;
-                        }
-
-                        self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
-
-                        if i == 0 {
-                            self.line.should_not_start_newline_forced = false;
-                        }
+                while let Some((i, (e, src_span))) = events.next() {
+                    if events.peek().is_none() {
+                        self.line.should_end_newline_forced = false;
                     }
-                });
+
+                    self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
+
+                    if i == 0 {
+                        self.line.should_not_start_newline_forced = false;
+                    }
+                }
             });
+        });
         // NOTE: deliberately NOT updating last_content_h from skip-paint's
         // `out.content_size.y`. That value is unreliable: skip-paint does
         // `set_height(page_size.y)` (min height) then `allocate_space(Vec2(0,
@@ -1394,7 +1443,10 @@ impl CommonMarkViewerInternal {
         if self.is_table {
             self.line.try_insert_start(ui);
 
-            let id = ui.id().with("_table").with(self.curr_table);
+            let id = ui
+                .id()
+                .with("_table")
+                .with(self.table_source_start.take().unwrap_or(self.curr_table));
             self.curr_table += 1;
 
             // Consume events into header/rows up front so we know the column count
@@ -1430,8 +1482,7 @@ impl CommonMarkViewerInternal {
             let body_heights: Vec<f32> = rows
                 .iter()
                 .map(|row| {
-                    row
-                        .iter()
+                    row.iter()
                         .map(|cell| table_cell_height(cell, line_h, cache, ui))
                         .fold(cell_h, f32::max)
                 })
@@ -1483,9 +1534,7 @@ impl CommonMarkViewerInternal {
                                                     &mut self.line.should_end_newline,
                                                     false,
                                                 );
-                                                self.event(
-                                                    ui, e, src_span, cache, options, col_w,
-                                                );
+                                                self.event(ui, e, src_span, cache, options, col_w);
                                                 self.line.should_start_newline = tmp_start;
                                                 self.line.should_end_newline = tmp_end;
                                             }
@@ -1494,10 +1543,7 @@ impl CommonMarkViewerInternal {
                                 });
                             table.body(|mut body| {
                                 for (row_idx, row) in rows.into_iter().enumerate() {
-                                    let h = body_heights
-                                        .get(row_idx)
-                                        .copied()
-                                        .unwrap_or(cell_h);
+                                    let h = body_heights.get(row_idx).copied().unwrap_or(cell_h);
                                     body.row(h, |mut row_ui| {
                                         for col in row {
                                             row_ui.col(|ui| {
@@ -1545,7 +1591,7 @@ impl CommonMarkViewerInternal {
         max_width: f32,
     ) {
         match event {
-            pulldown_cmark::Event::Start(tag) => self.start_tag(ui, tag, options),
+            pulldown_cmark::Event::Start(tag) => self.start_tag(ui, tag, src_span.start, options),
             pulldown_cmark::Event::End(tag) => self.end_tag(ui, tag, cache, options, max_width),
             pulldown_cmark::Event::Text(text) => {
                 self.event_text_with_highlights(text, &src_span, cache, ui, options);
@@ -1567,7 +1613,7 @@ impl CommonMarkViewerInternal {
                 // code text. Wrapped (>56 char) code skips highlighting in v1.
                 let interior_span = if !wrap && src_span.len() >= text.len() {
                     let delim_total = src_span.len() - text.len();
-                    if delim_total > 0 && delim_total % 2 == 0 {
+                    if delim_total > 0 && delim_total.is_multiple_of(2) {
                         let bt = delim_total / 2;
                         Some((src_span.start + bt)..(src_span.end - bt))
                     } else {
@@ -1701,8 +1747,7 @@ impl CommonMarkViewerInternal {
             // manually with a monospace font instead of calling `.code()` — that gives
             // the visual effect of code (monospace + slightly larger weight) while
             // letting our background_color survive.
-            let mut t = egui::RichText::new(text.as_ref())
-                .text_style(egui::TextStyle::Monospace);
+            let mut t = egui::RichText::new(text.as_ref()).text_style(egui::TextStyle::Monospace);
             if self.text_style.strong {
                 t = t.strong();
             }
@@ -1884,7 +1929,13 @@ impl CommonMarkViewerInternal {
         }
     }
 
-    fn start_tag(&mut self, ui: &mut Ui, tag: pulldown_cmark::Tag, options: &CommonMarkOptions) {
+    fn start_tag(
+        &mut self,
+        ui: &mut Ui,
+        tag: pulldown_cmark::Tag,
+        source_start: usize,
+        options: &CommonMarkOptions,
+    ) {
         match tag {
             pulldown_cmark::Tag::Paragraph => {
                 self.line.try_insert_start(ui);
@@ -1913,6 +1964,7 @@ impl CommonMarkViewerInternal {
                 self.is_blockquote = true;
             }
             pulldown_cmark::Tag::CodeBlock(c) => {
+                self.code_block_source_start = Some(source_start);
                 // List items render in one horizontal_wrapped row; end it before a block widget.
                 if self.list.is_inside_a_list() {
                     ui.end_row();
@@ -1962,6 +2014,7 @@ impl CommonMarkViewerInternal {
                 footnote(ui, &note);
             }
             pulldown_cmark::Tag::Table(_) => {
+                self.table_source_start = Some(source_start);
                 self.is_table = true;
             }
             pulldown_cmark::Tag::TableHead => {}
@@ -1983,9 +2036,11 @@ impl CommonMarkViewerInternal {
                 });
             }
             pulldown_cmark::Tag::Image { dest_url, .. } => {
-                self.image = Some(crate::Image::new(&dest_url, options));
+                self.image =
+                    Some(crate::Image::new(&dest_url, options).with_source_start(source_start));
             }
             pulldown_cmark::Tag::HtmlBlock => {
+                self.html_block_source_start = Some(source_start);
                 self.line.try_insert_start(ui);
             }
             pulldown_cmark::Tag::MetadataBlock(_) => {}
@@ -2032,10 +2087,13 @@ impl CommonMarkViewerInternal {
                     let left_edge = ui.min_rect().left();
                     let heading_rect = egui::Rect::from_min_size(
                         egui::pos2(left_edge, available.top()),
-                        egui::vec2(available.width() + (available.left() - left_edge), available.height()),
+                        egui::vec2(
+                            available.width() + (available.left() - left_edge),
+                            available.height(),
+                        ),
                     );
                     let rich_texts = std::mem::take(&mut self.current_heading_rich_texts);
-                    ui.allocate_ui_at_rect(heading_rect, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(heading_rect), |ui| {
                         for rt in rich_texts {
                             ui.label(rt);
                         }
@@ -2082,19 +2140,14 @@ impl CommonMarkViewerInternal {
                         // 323 (off by 44 = panel chrome height), so scrolling
                         // to (323-50)=273 landed 44 px past the heading.
                         let content_y = y - ui.min_rect().top();
-                        // Always refresh with current layout, not first-paint
-                        // value. First-paint pinning produced increasing
-                        // overshoot for deeper headers — the first frame
-                        // renders before async font fallbacks (Noto) finish
-                        // loading; once fonts settle, line widths shrink/grow
-                        // by a few px per line, and the cumulative drift
-                        // moves every heading's true y by an amount that
-                        // scales linearly with its depth in the doc. The
-                        // pinned cache then sends outline-clicks to the
-                        // stale (under-shot) position. Updating each paint
-                        // keeps the click target in sync with the current
-                        // rendered layout.
-                        cache.record_header_content_y(&key, content_y);
+                        // The full bootstrap records every heading in source
+                        // order. Viewport slices start with fresh renderer
+                        // state and therefore cannot derive duplicate-heading
+                        // occurrence numbers for headings above the viewport;
+                        // do not let a slice overwrite the authoritative
+                        // bootstrap position. Layout changes clear this cache
+                        // and trigger a new full bootstrap.
+                        cache.record_header_content_y_if_absent(&key, content_y);
                     }
                 }
                 self.current_heading_text.clear();
@@ -2168,13 +2221,18 @@ impl CommonMarkViewerInternal {
             }
             pulldown_cmark::TagEnd::HtmlBlock => {
                 if !self.html_block.is_empty() {
-                    if let Some(table) = egui_commonmark_backend_extended::html_table::parse_html_table(&self.html_block) {
+                    if let Some(table) =
+                        egui_commonmark_backend_extended::html_table::parse_html_table(
+                            &self.html_block,
+                        )
+                    {
                         self.render_html_table(ui, &table, options, max_width);
                     } else if let Some(html_fn) = options.html_fn {
                         html_fn(ui, &self.html_block);
                     } else {
                         // Render non-table HTML as plain text (existing fallback)
-                        let text: pulldown_cmark::CowStr = std::mem::take(&mut self.html_block).into();
+                        let text: pulldown_cmark::CowStr =
+                            std::mem::take(&mut self.html_block).into();
                         self.event_text(text, ui, options);
                     }
                     self.html_block.clear();
@@ -2198,7 +2256,11 @@ impl CommonMarkViewerInternal {
         max_width: f32,
     ) {
         if let Some(block) = self.code_block.take() {
-            let id = ui.id().with("_code_block").with(self.curr_code_block);
+            let id = ui.id().with("_code_block").with(
+                self.code_block_source_start
+                    .take()
+                    .unwrap_or(self.curr_code_block),
+            );
             self.curr_code_block += 1;
             block.end(ui, cache, options, max_width, id);
             self.line.try_insert_end(ui);
@@ -2212,7 +2274,11 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
         max_width: f32,
     ) {
-        let id = ui.id().with("_html_table").with(self.curr_table);
+        let id = ui.id().with("_html_table").with(
+            self.html_block_source_start
+                .take()
+                .unwrap_or(self.curr_table),
+        );
         self.curr_table += 1;
 
         let num_cols = table
@@ -2310,24 +2376,18 @@ impl CommonMarkViewerInternal {
                                         });
                                     }
                                     for (row_idx, row) in table.rows.iter().enumerate() {
-                                        let h = body_heights
-                                            .get(row_idx)
-                                            .copied()
-                                            .unwrap_or(cell_h);
+                                        let h =
+                                            body_heights.get(row_idx).copied().unwrap_or(cell_h);
                                         body.row(h, |mut row_ui| {
                                             for cell in row {
                                                 row_ui.col(|ui| {
                                                     egui::Frame::NONE
-                                                        .inner_margin(egui::Margin::symmetric(
-                                                            8, 4,
-                                                        ))
+                                                        .inner_margin(egui::Margin::symmetric(8, 4))
                                                         .show(ui, |ui| {
                                                             let rich_text = self
                                                                 .text_style
                                                                 .to_richtext_with_options(
-                                                                    ui,
-                                                                    cell,
-                                                                    options,
+                                                                    ui, cell, options,
                                                                 );
                                                             ui.label(rich_text);
                                                         });
@@ -2339,10 +2399,7 @@ impl CommonMarkViewerInternal {
                         } else {
                             builder.body(|mut body| {
                                 for (row_idx, row) in table.rows.iter().enumerate() {
-                                    let h = body_heights
-                                        .get(row_idx)
-                                        .copied()
-                                        .unwrap_or(cell_h);
+                                    let h = body_heights.get(row_idx).copied().unwrap_or(cell_h);
                                     body.row(h, |mut row_ui| {
                                         for cell in row {
                                             row_ui.col(|ui| {
@@ -2352,9 +2409,7 @@ impl CommonMarkViewerInternal {
                                                         let rich_text = self
                                                             .text_style
                                                             .to_richtext_with_options(
-                                                                ui,
-                                                                cell,
-                                                                options,
+                                                                ui, cell, options,
                                                             );
                                                         ui.label(rich_text);
                                                     });
@@ -2433,7 +2488,8 @@ mod tests {
 
     #[test]
     fn latex_style_math_delimiters_produce_math_events_with_original_ranges() {
-        let markdown = "before \\(x_t\\) after\n\n\\[\n\\boxed{\\operatorname{RMean}_{31}(x)}\n\\]\n";
+        let markdown =
+            "before \\(x_t\\) after\n\n\\[\n\\boxed{\\operatorname{RMean}_{31}(x)}\n\\]\n";
         let events = parse_markdown_events(markdown, true);
 
         let (inline, inline_range) = events
@@ -2466,20 +2522,38 @@ escaped \\(literal\\)
 "#;
         let events = parse_markdown_events(markdown, true);
 
-        assert!(!events.iter().any(|(event, _)| matches!(
-            event,
-            Event::InlineMath(_) | Event::DisplayMath(_)
-        )));
+        assert!(!events
+            .iter()
+            .any(|(event, _)| matches!(event, Event::InlineMath(_) | Event::DisplayMath(_))));
+    }
+
+    #[test]
+    fn latex_style_math_does_not_close_inside_other_markdown_structures() {
+        for markdown in [
+            r"prefix \( unfinished `\)` suffix",
+            r"prefix \( unfinished [link](target\)) suffix",
+            r"prefix \( unfinished <span data-close='\)'>suffix</span>",
+            "| value | note |\n|---|---|\n| \\(x | `\\)` |",
+            "| value | note |\n|---|---|\n| \\(x | [link](target\\)) |",
+        ] {
+            let events = parse_markdown_events(markdown, true);
+            assert!(
+                !events.iter().any(|(event, _)| matches!(
+                    event,
+                    Event::InlineMath(_) | Event::DisplayMath(_)
+                )),
+                "unexpected math event for {markdown:?}"
+            );
+        }
     }
 
     #[test]
     fn unmatched_latex_style_math_delimiter_stays_literal() {
         let markdown = r"prefix \( without a close";
         let events = parse_markdown_events(markdown, true);
-        assert!(!events.iter().any(|(event, _)| matches!(
-            event,
-            Event::InlineMath(_) | Event::DisplayMath(_)
-        )));
+        assert!(!events
+            .iter()
+            .any(|(event, _)| matches!(event, Event::InlineMath(_) | Event::DisplayMath(_))));
     }
 
     #[test]
@@ -2570,6 +2644,60 @@ escaped \\(literal\\)
             let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
 
             assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
+        });
+    }
+
+    #[test]
+    fn scrollable_renderer_resumes_only_after_complete_blocks() {
+        egui::__run_test_ui(|ui| {
+            ui.set_width(600.0);
+            ui.set_height(300.0);
+            let markdown = concat!(
+                "# Heading\n\n",
+                "Paragraph before.\n\n",
+                "- outer\n  - nested\n  - nested two\n- second\n\n",
+                "> quoted\n> continuation\n\n",
+                "| a | b |\n|---|---|\n| one | two |\n\n",
+                "Final paragraph.\n",
+            );
+            let source_id = egui::Id::new("virtualization-regression");
+            let mut cache = CommonMarkCache::default();
+            let options = CommonMarkOptions::default();
+
+            CommonMarkViewerInternal::new().show_scrollable(
+                source_id,
+                ui,
+                &mut cache,
+                &options,
+                markdown,
+                Some(1),
+                None,
+                None,
+            );
+            let sc = scroll_cache(&mut cache, &source_id);
+            assert!(sc.page_size.is_some_and(|size| size.y > 0.0));
+            assert!(!sc.split_points.is_empty());
+            for (index, _, _) in &sc.split_points {
+                if let Some((event, _)) = sc.events.get(*index) {
+                    assert!(
+                        !matches!(event, Event::End(_)),
+                        "split resumed at an unmatched End event: {event:?}"
+                    );
+                }
+            }
+
+            // A second paint exercises the viewport path rather than the
+            // bootstrap path and must preserve nested-container state.
+            CommonMarkViewerInternal::new().show_scrollable(
+                source_id,
+                ui,
+                &mut cache,
+                &options,
+                markdown,
+                Some(1),
+                None,
+                None,
+            );
         });
     }
 
@@ -2728,11 +2856,11 @@ escaped \\(literal\\)
     fn replacement_highlight_is_indivisible_for_any_source_overlap() {
         let source = 22..31;
         assert_eq!(
-            highlight_for_source_span(&source, &[25..26], None),
+            highlight_for_source_span(&source, std::slice::from_ref(&(25..26)), None),
             HighlightKind::Match
         );
         assert_eq!(
-            highlight_for_source_span(&source, &[0..100], None),
+            highlight_for_source_span(&source, std::slice::from_ref(&(0..100)), None),
             HighlightKind::Match
         );
     }
@@ -2740,7 +2868,7 @@ escaped \\(literal\\)
     #[test]
     fn active_overlap_wins_over_regular_match() {
         assert_eq!(
-            highlight_for_source_span(&(22..31), &[22..31], Some(&(24..25))),
+            highlight_for_source_span(&(22..31), std::slice::from_ref(&(22..31)), Some(&(24..25)),),
             HighlightKind::Active
         );
     }
@@ -2841,6 +2969,7 @@ escaped \\(literal\\)
                         classes: Vec::new(),
                         attrs: Vec::new(),
                     },
+                    0,
                     &options,
                 );
                 renderer.event(

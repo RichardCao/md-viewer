@@ -2,7 +2,7 @@
 name = "md-viewer"
 version = "0.1.15"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 description = "Fast, lightweight markdown viewer for Linux with tabs, file explorer, and live reload"
 license = "MIT"
 repository = "https://github.com/aydiler/md-viewer"
@@ -64,6 +64,8 @@ serde = { version = "1", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 regex = "1.12.2"
+pulldown-cmark = { version = "0.13", default-features = false }
+percent-encoding = "2.3"
 fontdb = "0.23"
 sys-locale = "0.3.2"
 ttf-parser = "0.25"
@@ -92,4 +94,3 @@ codegen-units = 4
 [patch.crates-io]
 egui_commonmark_extended = { path = "crates/egui_commonmark/egui_commonmark", version = "0.25.0" }
 egui_commonmark_backend_extended = { path = "crates/egui_commonmark/egui_commonmark_backend", version = "0.25.0" }
-egui_commonmark_macros_extended = { path = "crates/egui_commonmark/egui_commonmark_macros", version = "0.25.0" }

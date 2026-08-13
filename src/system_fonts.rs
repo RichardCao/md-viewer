@@ -392,17 +392,8 @@ fn install_regular_fonts(
     let mut loaded_keys = Vec::new();
     let mut families_by_key = HashMap::new();
     let mut primary_key = None;
-    let mut cjk_faces = Vec::new();
 
     for spec in ordered_regular_specs(locale) {
-        if spec.cjk_region.is_some()
-            && cjk_faces
-                .iter()
-                .any(|id| font_has_glyphs(database, *id, spec.required_glyphs))
-        {
-            continue;
-        }
-
         let Some(resolved) = resolve_font(
             database,
             spec.families,
@@ -414,10 +405,6 @@ fn install_regular_fonts(
         if !loaded_faces.insert(resolved.id) {
             continue;
         }
-        if spec.cjk_region.is_some() {
-            cjk_faces.push(resolved.id);
-        }
-
         log::info!(
             "Loaded system font fallback {} ({}) from {} (face index {})",
             spec.key,

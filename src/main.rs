@@ -35,9 +35,6 @@ const RECENT_SHOWN: usize = 6;
 /// Compiled regex for parsing markdown headers (lazy, compiled once)
 static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+)$").unwrap());
 
-/// Compiled regex for parsing markdown links (lazy, compiled once)
-static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\(([^)]+)\)").unwrap());
-
 /// Inline-code contents are scanned separately so a local path remains
 /// discoverable when it directly touches prose or non-ASCII punctuation.
 static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\r\n]+)`").unwrap());
@@ -522,7 +519,7 @@ struct FileExplorer {
     tree: Vec<FileTreeNode>,
     expanded_dirs: HashSet<PathBuf>,
     sort_order: SortOrder,
-    /// Receiver for async directory scan results (GVFS paths scan in background)
+    /// Receiver for asynchronous root-directory scan results.
     pending_scan: Option<Receiver<Vec<FileTreeNode>>>,
 }
 
@@ -544,9 +541,14 @@ impl FileExplorer {
                 continue;
             }
 
-            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+            let file_type = entry.file_type().ok();
+            let modified = matches!(sort_order, SortOrder::DateAsc | SortOrder::DateDesc)
+                .then(|| entry.metadata().ok().and_then(|m| m.modified().ok()))
+                .flatten();
 
-            if entry_path.is_dir() {
+            let is_directory = file_type.is_some_and(|kind| kind.is_dir())
+                || file_type.is_some_and(|kind| kind.is_symlink()) && entry_path.is_dir();
+            if is_directory {
                 // Show all directories - let users expand what they want
                 // (Avoids O(n×m) scanning during initial directory scan)
                 nodes.push(FileTreeNode::Directory {
@@ -613,8 +615,7 @@ impl FileExplorer {
             .unwrap_or(false)
     }
 
-    /// Set root directory and rescan (shallow).
-    /// For GVFS paths, scan runs in a background thread to avoid blocking the UI.
+    /// Set root directory and rescan shallowly in the background.
     fn set_root(&mut self, path: PathBuf) {
         // Convert empty path to current directory
         let path = if path.as_os_str().is_empty() {
@@ -623,21 +624,25 @@ impl FileExplorer {
             path
         };
         self.root = Some(path.clone());
-        if is_gvfs_path(&path) {
-            // Scan in background thread — tree populates when ready
-            let sort_order = self.sort_order;
-            let (tx, rx) = mpsc::channel();
-            std::thread::Builder::new()
-                .name("gvfs-scan".into())
-                .spawn(move || {
-                    let tree = Self::scan_directory_shallow(&path, sort_order);
-                    let _ = tx.send(tree);
-                })
-                .expect("failed to spawn GVFS scan thread");
-            self.pending_scan = Some(rx);
-        } else {
+        if !self.start_root_scan(path.clone(), "explorer-scan") {
             self.tree = Self::scan_directory_shallow(&path, self.sort_order);
         }
+    }
+
+    fn start_root_scan(&mut self, path: PathBuf, thread_name: &str) -> bool {
+        let sort_order = self.sort_order;
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(thread_name.to_owned())
+            .spawn(move || {
+                let tree = Self::scan_directory_shallow(&path, sort_order);
+                let _ = tx.send(tree);
+            })
+            .is_ok();
+        if spawned {
+            self.pending_scan = Some(rx);
+        }
+        spawned
     }
 
     /// Check if a background scan completed and apply results
@@ -653,22 +658,9 @@ impl FileExplorer {
     }
 
     /// Refresh the file tree (clears loaded state, rescans shallowly).
-    /// For GVFS paths, runs in background to avoid blocking the UI thread.
     fn refresh(&mut self) {
         if let Some(root) = &self.root.clone() {
-            if is_gvfs_path(root) {
-                // Re-scan in background
-                let sort_order = self.sort_order;
-                let root = root.clone();
-                let (tx, rx) = mpsc::channel();
-                std::thread::Builder::new()
-                    .name("gvfs-refresh".into())
-                    .spawn(move || {
-                        let tree = Self::scan_directory_shallow(&root, sort_order);
-                        let _ = tx.send(tree);
-                    })
-                    .expect("failed to spawn GVFS refresh thread");
-                self.pending_scan = Some(rx);
+            if self.start_root_scan(root.clone(), "explorer-refresh") {
                 return;
             }
             self.tree = Self::scan_directory_shallow(root, self.sort_order);
@@ -678,6 +670,53 @@ impl FileExplorer {
                 self.load_children(&dir_path);
             }
         }
+    }
+
+    /// Rescan only the changed directory while preserving the rest of the tree.
+    fn refresh_directory(&mut self, directory: &Path) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        if directory == root {
+            self.tree = Self::scan_directory_shallow(&root.clone(), self.sort_order);
+        } else {
+            let mut replacement = Some(Self::scan_directory_shallow(
+                &directory.to_path_buf(),
+                self.sort_order,
+            ));
+            if !Self::replace_directory_children(&mut self.tree, directory, &mut replacement) {
+                return;
+            }
+        }
+
+        // Restore lazy children from shallowest to deepest so every parent is
+        // available before its expanded descendants are loaded.
+        let mut expanded: Vec<PathBuf> = self.expanded_dirs.iter().cloned().collect();
+        expanded.sort_by_key(|path| path.components().count());
+        for path in expanded {
+            self.load_children(&path);
+        }
+    }
+
+    fn replace_directory_children(
+        nodes: &mut [FileTreeNode],
+        directory: &Path,
+        replacement: &mut Option<Vec<FileTreeNode>>,
+    ) -> bool {
+        for node in nodes {
+            if let FileTreeNode::Directory { path, children, .. } = node {
+                if path == directory {
+                    *children = replacement.take();
+                    return true;
+                }
+                if let Some(children) = children {
+                    if Self::replace_directory_children(children, directory, replacement) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Load children for a specific directory (lazy loading)
@@ -876,10 +915,10 @@ impl Tab {
             .unwrap_or_else(|| "file://".to_string())
     }
 
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf) -> io::Result<Self> {
         // Canonicalize path for consistent comparison with watcher events
         let path = path.canonicalize().unwrap_or(path);
-        let content = fs::read_to_string(&path).unwrap_or_default();
+        let content = String::from_utf8_lossy(&fs::read(&path)?).into_owned();
         let parsed = parse_headers(&content);
         let local_links = parse_local_links(&content, &path);
         let content_lines = content.lines().count();
@@ -890,7 +929,7 @@ impl Tab {
             cache.add_link_hook(link);
         }
 
-        Self {
+        Ok(Self {
             id: egui::Id::new(&path),
             path,
             content,
@@ -911,7 +950,7 @@ impl Tab {
             history_forward: Vec::new(),
             search_matches: Vec::new(),
             content_version: 1,
-        }
+        })
     }
 
     fn title(&self) -> String {
@@ -921,32 +960,11 @@ impl Tab {
             .unwrap_or_else(|| "Unknown".to_string())
     }
 
-    fn reload(&mut self) {
-        if !self.path.exists() {
-            return;
-        }
-
-        if let Ok(bytes) = fs::read(&self.path) {
-            let content = String::from_utf8_lossy(&bytes);
-            self.content_lines = content.lines().count();
-            self.content = content.into_owned();
-            self.cache = CommonMarkCache::default();
-            self.content_version = self.content_version.wrapping_add(1);
-            self.base_uri = Self::compute_base_uri(&self.path);
-
-            let parsed = parse_headers(&self.content);
-            self.document_title = parsed.document_title;
-            self.outline_headers = parsed.outline_headers;
-            self.collapsed_headers.clear();
-
-            self.local_links = parse_local_links(&self.content, &self.path);
-            for link in &self.local_links {
-                self.cache.add_link_hook(link);
-            }
-
-            // Stale byte ranges; caller rebuilds if search bar is open
-            self.search_matches.clear();
-        }
+    fn reload(&mut self) -> io::Result<()> {
+        let bytes = fs::read(&self.path)?;
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        self.apply_loaded_content(self.path.clone(), content, false);
+        Ok(())
     }
 
     /// Rebuild `search_matches` for `query`. Empty query clears matches.
@@ -954,67 +972,70 @@ impl Tab {
         self.search_matches = find_matches(&self.content, query);
     }
 
-    fn load_file(&mut self, path: &PathBuf) {
-        if !path.exists() {
-            return;
-        }
-
-        if let Ok(bytes) = fs::read(path) {
-            let content = String::from_utf8_lossy(&bytes);
-            self.content_lines = content.lines().count();
-            self.content = content.into_owned();
-            self.path = path.clone();
-            self.id = egui::Id::new(path);
-            self.cache = CommonMarkCache::default();
-            self.content_version = self.content_version.wrapping_add(1);
-            self.scroll_offset = 0.0;
-            self.pending_scroll_offset = None;
-            self.base_uri = Self::compute_base_uri(&self.path);
-
-            let parsed = parse_headers(&self.content);
-            self.document_title = parsed.document_title;
-            self.outline_headers = parsed.outline_headers;
-            self.collapsed_headers.clear();
-
-            self.local_links = parse_local_links(&self.content, &self.path);
-            for link in &self.local_links {
-                self.cache.add_link_hook(link);
-            }
-
-            // Stale byte ranges; caller rebuilds if search bar is open
-            self.search_matches.clear();
-        }
+    fn load_file(&mut self, path: &Path) -> io::Result<()> {
+        let bytes = fs::read(path)?;
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        self.apply_loaded_content(path.to_path_buf(), content, true);
+        Ok(())
     }
 
-    fn navigate_to_link(&mut self, link: &str) {
+    fn apply_loaded_content(&mut self, path: PathBuf, content: String, reset_scroll: bool) {
+        self.content_lines = content.lines().count();
+        self.content = content;
+        self.path = path;
+        self.id = egui::Id::new(&self.path);
+        self.cache = CommonMarkCache::default();
+        self.content_version = self.content_version.wrapping_add(1);
+        if reset_scroll {
+            self.scroll_offset = 0.0;
+            self.pending_scroll_offset = None;
+        }
+        self.base_uri = Self::compute_base_uri(&self.path);
+
+        let parsed = parse_headers(&self.content);
+        self.document_title = parsed.document_title;
+        self.outline_headers = parsed.outline_headers;
+        self.collapsed_headers.clear();
+
+        self.local_links = parse_local_links(&self.content, &self.path);
+        for link in &self.local_links {
+            self.cache.add_link_hook(link);
+        }
+
+        // Stale byte ranges; caller rebuilds if search bar is open.
+        self.search_matches.clear();
+    }
+
+    fn navigate_to_link(&mut self, link: &str) -> io::Result<bool> {
         if link.starts_with('#') {
-            return;
+            return Ok(false);
         }
 
         let Some(current_dir) = self.path.parent() else {
-            return;
+            return Ok(false);
         };
 
         let Some(target_path) = resolve_local_link_path(link, current_dir) else {
-            return;
+            return Ok(false);
         };
 
-        self.navigate_to_path(&target_path);
+        self.navigate_to_path(&target_path)
     }
 
     /// Replace this tab's document and record a browser-like history entry.
-    fn navigate_to_path(&mut self, target_path: &Path) -> bool {
+    fn navigate_to_path(&mut self, target_path: &Path) -> io::Result<bool> {
         let Ok(target_path) = target_path.canonicalize() else {
-            return false;
+            return Ok(false);
         };
         if target_path == self.path || !target_path.is_file() {
-            return false;
+            return Ok(false);
         }
 
-        self.history_back.push(self.path.clone());
+        let previous_path = self.path.clone();
+        self.load_file(&target_path)?;
+        self.history_back.push(previous_path);
         self.history_forward.clear();
-        self.load_file(&target_path);
-        true
+        Ok(true)
     }
 
     fn check_link_hooks(&self) -> Option<String> {
@@ -1034,18 +1055,26 @@ impl Tab {
         !self.history_forward.is_empty()
     }
 
-    fn navigate_back(&mut self) {
-        if let Some(prev_path) = self.history_back.pop() {
-            self.history_forward.push(self.path.clone());
-            self.load_file(&prev_path);
-        }
+    fn navigate_back(&mut self) -> io::Result<bool> {
+        let Some(prev_path) = self.history_back.last().cloned() else {
+            return Ok(false);
+        };
+        let current_path = self.path.clone();
+        self.load_file(&prev_path)?;
+        self.history_back.pop();
+        self.history_forward.push(current_path);
+        Ok(true)
     }
 
-    fn navigate_forward(&mut self) {
-        if let Some(next_path) = self.history_forward.pop() {
-            self.history_back.push(self.path.clone());
-            self.load_file(&next_path);
-        }
+    fn navigate_forward(&mut self) -> io::Result<bool> {
+        let Some(next_path) = self.history_forward.last().cloned() else {
+            return Ok(false);
+        };
+        let current_path = self.path.clone();
+        self.load_file(&next_path)?;
+        self.history_forward.pop();
+        self.history_back.push(current_path);
+        Ok(true)
     }
 
     fn resolve_link(&self, link: &str) -> Option<PathBuf> {
@@ -1061,10 +1090,26 @@ impl Tab {
 
 /// Parse explicit links plus bare local Markdown file references, skipping code blocks.
 fn parse_local_links(content: &str, document_path: &Path) -> Vec<String> {
-    let link_re = &*LINK_RE;
     let mut links = Vec::new();
     let mut in_code_block = false;
     let document_dir = document_path.parent().unwrap_or_else(|| Path::new("."));
+
+    // Let the CommonMark parser handle explicit links. A regular expression
+    // cannot correctly cover reference links, nested parentheses, or titles.
+    for event in pulldown_cmark::Parser::new_ext(content, pulldown_cmark::Options::all()) {
+        match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. }) => {
+                let destination = dest_url.as_ref();
+                if is_local_markdown_link(destination) || destination.starts_with('#') {
+                    links.push(destination.to_owned());
+                }
+            }
+            pulldown_cmark::Event::Code(code) => {
+                register_existing_markdown_path(&code, document_dir, &mut links);
+            }
+            _ => {}
+        }
+    }
 
     for line in content.lines() {
         if line.trim_start().starts_with("```") {
@@ -1076,17 +1121,12 @@ fn parse_local_links(content: &str, document_path: &Path) -> Vec<String> {
             continue;
         }
 
-        for cap in link_re.captures_iter(line) {
-            let destination = &cap[2];
-            if is_local_markdown_link(destination) || destination.starts_with('#') {
-                links.push(destination.to_string());
-            }
-        }
-
+        // Preserve the viewer extension that turns bare Markdown paths into
+        // links. Inline code is included because documentation commonly uses
+        // it for file names; duplicates are removed below.
         for cap in INLINE_CODE_RE.captures_iter(line) {
             register_existing_markdown_path(&cap[1], document_dir, &mut links);
         }
-
         for token in line.split_whitespace() {
             let destination = token.trim_matches(|ch: char| {
                 matches!(
@@ -1186,7 +1226,11 @@ fn resolve_local_link_path(destination: &str, document_dir: &Path) -> Option<Pat
         return url::Url::parse(destination).ok()?.to_file_path().ok();
     }
 
-    let path = Path::new(destination.split('#').next().unwrap_or(destination));
+    let encoded_path = destination.split('#').next().unwrap_or(destination);
+    let decoded_path = percent_encoding::percent_decode_str(encoded_path)
+        .decode_utf8()
+        .ok()?;
+    let path = Path::new(decoded_path.as_ref());
     Some(if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1328,53 +1372,42 @@ fn find_matches(content: &str, query: &str) -> Vec<SearchMatch> {
     matches
 }
 
-/// Check if header at `index` should be hidden because an ancestor is collapsed
-fn header_is_hidden(headers: &[Header], index: usize, collapsed: &HashSet<usize>) -> bool {
-    if index == 0 || index >= headers.len() {
-        return false;
-    }
-    let mut search_level = headers[index].level;
-    // Walk backwards to find ancestors
-    for i in (0..index).rev() {
-        let h = &headers[i];
-        // Only consider headers with lower level than what we're searching for
-        if h.level < search_level {
-            // Found an ancestor
-            if collapsed.contains(&i) {
-                return true;
-            }
-            // This ancestor is not collapsed, but check its ancestors too
-            // Update search_level to only look for even lower level headers
-            search_level = h.level;
-        }
-        // Headers at same or higher level are siblings/cousins, skip them
-    }
-    false
+struct OutlineLayout {
+    visible_indices: Vec<usize>,
+    has_children: Vec<bool>,
 }
 
-/// Check if a header has any children (headers with higher level immediately following)
-fn header_has_children(headers: &[Header], index: usize) -> bool {
-    if index >= headers.len() {
-        return false;
-    }
-    let current_level = headers[index].level;
-    // Look at the next header
-    if let Some(next) = headers.get(index + 1) {
-        // A child has a higher level number (e.g., h3 is child of h2)
-        next.level > current_level
-    } else {
-        false
-    }
-}
-
-/// Check if any header in the list has children
-fn any_header_has_children(headers: &[Header]) -> bool {
-    for i in 0..headers.len() {
-        if header_has_children(headers, i) {
-            return true;
+/// Analyze hierarchy and collapsed ancestors in one O(H) pass.
+fn analyze_outline(headers: &[Header], collapsed: &HashSet<usize>) -> OutlineLayout {
+    let has_children: Vec<bool> = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            headers
+                .get(index + 1)
+                .is_some_and(|next| next.level > header.level)
+        })
+        .collect();
+    // Stack stores (heading level, descendants hidden by this branch).
+    let mut ancestors: Vec<(u8, bool)> = Vec::new();
+    let mut visible_indices = Vec::with_capacity(headers.len());
+    for (index, header) in headers.iter().enumerate() {
+        while ancestors
+            .last()
+            .is_some_and(|(level, _)| *level >= header.level)
+        {
+            ancestors.pop();
         }
+        let hidden = ancestors.last().is_some_and(|(_, hidden)| *hidden);
+        if !hidden {
+            visible_indices.push(index);
+        }
+        ancestors.push((header.level, hidden || collapsed.contains(&index)));
     }
-    false
+    OutlineLayout {
+        visible_indices,
+        has_children,
+    }
 }
 
 #[global_allocator]
@@ -1581,7 +1614,6 @@ struct MarkdownApp {
     // Flash effect for updated files (path -> start time)
     flashing_paths: HashMap<PathBuf, Instant>,
     // True if running on virtual display (e.g., Xvfb :99) - limits frame rate
-    is_virtual_display: bool,
     // Stored context for waking egui from the watcher bridge thread
     egui_ctx: egui::Context,
     // Track state to avoid unconditional repaints
@@ -1668,15 +1700,28 @@ impl MarkdownApp {
             .unwrap_or(OUTLINE_DEFAULT_WIDTH);
 
         // Determine initial tabs
+        let mut startup_errors = Vec::new();
         let initial_tabs: Vec<Tab> = if let Some(ref path) = file {
             // CLI argument takes priority
-            vec![Tab::new(path.clone())]
+            match Tab::new(path.clone()) {
+                Ok(tab) => vec![tab],
+                Err(error) => {
+                    startup_errors.push(format!("Unable to open {}: {error}", path.display()));
+                    Vec::new()
+                }
+            }
         } else if let Some(paths) = persisted.open_tabs {
             // Restore previous session tabs
             paths
                 .into_iter()
                 .filter(|p| p.exists())
-                .map(Tab::new)
+                .filter_map(|path| match Tab::new(path.clone()) {
+                    Ok(tab) => Some(tab),
+                    Err(error) => {
+                        log::warn!("Unable to restore {}: {error}", path.display());
+                        None
+                    }
+                })
                 .collect()
         } else {
             // No file and no saved session → start empty (welcome page).
@@ -1727,12 +1772,6 @@ impl MarkdownApp {
         #[cfg(feature = "mcp")]
         log::info!("MCP bridge listening on port {}", mcp_bridge.port());
 
-        // Detect virtual display (e.g., Xvfb :99) to limit frame rate
-        // Virtual displays lack vsync, causing unlimited FPS and high CPU
-        let is_virtual_display = std::env::var("DISPLAY")
-            .map(|d| d != ":0" && d != ":0.0" && !d.is_empty())
-            .unwrap_or(false);
-
         let mut app = Self {
             tabs,
             active_tab,
@@ -1740,7 +1779,7 @@ impl MarkdownApp {
             zoom_level,
             show_outline,
             watch_enabled: watch,
-            error_message: None,
+            error_message: (!startup_errors.is_empty()).then(|| startup_errors.join("; ")),
             is_dragging: false,
             watcher: None,
             watcher_rx: None,
@@ -1753,7 +1792,6 @@ impl MarkdownApp {
             explorer_width,
             outline_width,
             flashing_paths: HashMap::new(),
-            is_virtual_display,
             egui_ctx: cc.egui_ctx.clone(),
             last_applied_dark_mode: None,
             last_window_title: String::new(),
@@ -1845,7 +1883,6 @@ impl MarkdownApp {
     fn open_in_new_tab(&mut self, path: PathBuf) {
         // Canonicalize for consistent comparison with existing tabs
         let path = path.canonicalize().unwrap_or(path);
-        self.record_recent(&path);
         // Check if already open
         if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
             self.active_tab = idx;
@@ -1854,7 +1891,14 @@ impl MarkdownApp {
         }
 
         // Add new tab
-        let tab = Tab::new(path);
+        let tab = match Tab::new(path.clone()) {
+            Ok(tab) => tab,
+            Err(error) => {
+                self.error_message = Some(format!("Unable to open {}: {error}", path.display()));
+                return;
+            }
+        };
+        self.record_recent(&path);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.title_dirty = true;
@@ -1872,10 +1916,17 @@ impl MarkdownApp {
             return;
         }
 
-        let changed = self
-            .tabs
-            .get_mut(self.active_tab)
-            .is_some_and(|tab| tab.navigate_to_path(path));
+        let changed = match self.tabs.get_mut(self.active_tab) {
+            Some(tab) => match tab.navigate_to_path(path) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.error_message =
+                        Some(format!("Unable to open {}: {error}", path.display()));
+                    false
+                }
+            },
+            None => false,
+        };
         if !changed {
             return;
         }
@@ -1892,10 +1943,13 @@ impl MarkdownApp {
     fn navigate_active_history(&mut self, go_back: bool) {
         let previous_path = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            if go_back {
-                tab.navigate_back();
+            let result = if go_back {
+                tab.navigate_back()
             } else {
-                tab.navigate_forward();
+                tab.navigate_forward()
+            };
+            if let Err(error) = result {
+                self.error_message = Some(format!("Unable to navigate history: {error}"));
             }
         }
         let current_path = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
@@ -2303,7 +2357,7 @@ impl MarkdownApp {
 
     fn reload_changed_tabs(&mut self, changed_paths: Vec<PathBuf>) {
         let now = Instant::now();
-        let mut refresh_tree = false;
+        let mut refresh_directories = HashSet::new();
         // If the active tab gets reloaded while the find bar is open, its
         // `search_matches` will be cleared by `Tab::reload`. Force a rebuild
         // on the next frame by invalidating the cache-validity shadow state.
@@ -2318,7 +2372,9 @@ impl MarkdownApp {
             if let Some(root) = &self.file_explorer.root {
                 // Check if the changed path is within the explorer root
                 if path.starts_with(root) {
-                    refresh_tree = true;
+                    if let Some(parent) = path.parent() {
+                        refresh_directories.insert(parent.to_path_buf());
+                    }
                 }
 
                 let mut current = path.parent();
@@ -2343,7 +2399,11 @@ impl MarkdownApp {
             for tab in &mut self.tabs {
                 if tab.path == path {
                     log::info!("Reloading tab: {:?}", path);
-                    tab.reload();
+                    if let Err(error) = tab.reload() {
+                        self.error_message =
+                            Some(format!("Unable to reload {}: {error}", path.display()));
+                        continue;
+                    }
                     if Some(&tab.path) == active_path.as_ref() {
                         active_was_reloaded = true;
                     }
@@ -2355,10 +2415,11 @@ impl MarkdownApp {
             }
         }
 
-        // Refresh the file explorer tree if any changes were within the explorer root
-        if refresh_tree {
-            log::info!("Refreshing file explorer tree");
-            self.file_explorer.refresh();
+        // Refresh only affected explorer parents rather than synchronously
+        // rebuilding the root and every expanded subtree after each save.
+        for directory in refresh_directories {
+            log::debug!("Refreshing explorer directory: {:?}", directory);
+            self.file_explorer.refresh_directory(&directory);
         }
     }
 
@@ -2757,7 +2818,10 @@ impl MarkdownApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         // Expand/Collapse All buttons (only if there are nested headers)
-                        let has_nested = any_header_has_children(&tab.outline_headers);
+                        let has_nested = tab
+                            .outline_headers
+                            .windows(2)
+                            .any(|pair| pair[1].level > pair[0].level);
                         if has_nested {
                             ui.horizontal(|ui| {
                                 ui.add_space(6.0);
@@ -2788,8 +2852,14 @@ impl MarkdownApp {
                                 ));
 
                                 if collapse_btn.clicked() {
-                                    for i in 0..tab.outline_headers.len() {
-                                        if header_has_children(&tab.outline_headers, i) {
+                                    let layout = analyze_outline(
+                                        &tab.outline_headers,
+                                        &tab.collapsed_headers,
+                                    );
+                                    for (i, has_children) in
+                                        layout.has_children.into_iter().enumerate()
+                                    {
+                                        if has_children {
                                             tab.collapsed_headers.insert(i);
                                         }
                                     }
@@ -2803,12 +2873,10 @@ impl MarkdownApp {
                         // O(total-headers) per frame. On a 100k-line doc with ~15k
                         // headers this is the difference between visibly laggy and
                         // smooth outline interactions.
-                        let visible_indices: Vec<usize> = (0..tab.outline_headers.len())
-                            .filter(|&i| {
-                                !header_is_hidden(&tab.outline_headers, i, &tab.collapsed_headers)
-                            })
-                            .collect();
-                        let show_fold_indicators = any_header_has_children(&tab.outline_headers);
+                        let outline_layout =
+                            analyze_outline(&tab.outline_headers, &tab.collapsed_headers);
+                        let visible_indices = outline_layout.visible_indices;
+                        let show_fold_indicators = has_nested;
                         // Row height: fold indicator is 20px tall, fold-indicator-less
                         // rows fall back to the standard interact_size which is
                         // typically 18–20px anyway. A small fudge keeps neighboring
@@ -2825,8 +2893,7 @@ impl MarkdownApp {
                                 for &idx in &visible_indices[row_range] {
                                     let header = &tab.outline_headers[idx];
 
-                                    let has_children =
-                                        header_has_children(&tab.outline_headers, idx);
+                                    let has_children = outline_layout.has_children[idx];
                                     let is_collapsed = tab.collapsed_headers.contains(&idx);
 
                                     // Indent based on header level (h2 = 0, h3 = 1 indent, etc.)
@@ -3085,6 +3152,7 @@ impl MarkdownApp {
 
     fn render_tab_content(&mut self, ui: &mut egui::Ui, ctrl_held: bool) -> Option<PathBuf> {
         let mut open_in_new_tab: Option<PathBuf> = None;
+        let mut navigation_error = None;
 
         // Snapshot search state before taking a mutable borrow on the active tab
         let search_is_open = self.search.is_open;
@@ -3098,18 +3166,32 @@ impl MarkdownApp {
 
         // Push current search match ranges into the cache so the renderer can paint highlights
         if search_is_open && !tab.search_matches.is_empty() {
-            let ranges: Vec<_> = tab
-                .search_matches
-                .iter()
-                .map(|m| m.byte_start..m.byte_end)
-                .collect();
             let active = tab
                 .search_matches
                 .get(active_idx)
                 .map(|m| m.byte_start..m.byte_end);
-            tab.cache.set_search_ranges(ranges);
-            tab.cache.set_active_search_range(active);
-        } else {
+            let ranges_unchanged = tab.cache.search_ranges().len() == tab.search_matches.len()
+                && tab
+                    .cache
+                    .search_ranges()
+                    .iter()
+                    .zip(&tab.search_matches)
+                    .all(|(range, found)| {
+                        range.start == found.byte_start && range.end == found.byte_end
+                    });
+            if !ranges_unchanged {
+                tab.cache.set_search_ranges(
+                    tab.search_matches
+                        .iter()
+                        .map(|found| found.byte_start..found.byte_end)
+                        .collect(),
+                );
+            }
+            if tab.cache.active_search_range() != active.as_ref() {
+                tab.cache.set_active_search_range(active);
+            }
+        } else if !tab.cache.search_ranges().is_empty() || tab.cache.active_search_range().is_some()
+        {
             tab.cache.clear_search_ranges();
         }
 
@@ -3248,8 +3330,14 @@ impl MarkdownApp {
                 }
             } else {
                 // Navigate in current tab
-                tab.navigate_to_link(&clicked_link);
+                if let Err(error) = tab.navigate_to_link(&clicked_link) {
+                    navigation_error = Some(format!("Unable to open {clicked_link}: {error}"));
+                }
             }
+        }
+
+        if let Some(error) = navigation_error {
+            self.error_message = Some(error);
         }
 
         open_in_new_tab
@@ -3934,13 +4022,6 @@ impl eframe::App for MarkdownApp {
             }
         }
 
-        // Limit frame rate on virtual displays (e.g., Xvfb) which lack vsync
-        // request_repaint_after alone doesn't limit actual frame rate, so we sleep
-        // This prevents 500%+ CPU usage during E2E testing
-        if self.is_virtual_display {
-            std::thread::sleep(Duration::from_millis(16)); // ~60 FPS cap
-        }
-
         // Apply theme settings only when dark_mode changes
         if self.last_applied_dark_mode != Some(self.dark_mode) {
             self.last_applied_dark_mode = Some(self.dark_mode);
@@ -4319,9 +4400,7 @@ impl eframe::App for MarkdownApp {
                         .add_enabled(can_back, egui::Button::new("← Back").shortcut_text("Alt+←"))
                         .clicked()
                     {
-                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                            tab.navigate_back();
-                        }
+                        go_back = true;
                         ui.close();
                     }
 
@@ -4337,9 +4416,7 @@ impl eframe::App for MarkdownApp {
                         )
                         .clicked()
                     {
-                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                            tab.navigate_forward();
-                        }
+                        go_forward = true;
                         ui.close();
                     }
                 });
@@ -5058,6 +5135,52 @@ mod tests {
     }
 
     #[test]
+    fn commonmark_reference_and_encoded_links_are_registered() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-reference-link-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(root.join("docs with spaces")).unwrap();
+        let document = root.join("index.md");
+        fs::write(&document, "# Index").unwrap();
+        fs::write(root.join("docs with spaces/guide(1).md"), "# Guide").unwrap();
+
+        let content =
+            "Read [the guide][guide].\n\n[guide]: docs%20with%20spaces/guide(1).md \"Title\"";
+        assert_eq!(
+            parse_local_links(content, &document),
+            vec!["docs%20with%20spaces/guide(1).md"]
+        );
+        assert!(
+            resolve_local_link_path("docs%20with%20spaces/guide(1).md", &root)
+                .is_some_and(|path| path.is_file())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explorer_keeps_symbolic_links_to_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-explorer-symlink-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(root.join("actual-docs")).unwrap();
+        symlink(root.join("actual-docs"), root.join("linked-docs")).unwrap();
+
+        let nodes = FileExplorer::scan_directory_shallow(&root, SortOrder::NameAsc);
+        assert!(nodes.iter().any(|node| {
+            matches!(node, FileTreeNode::Directory { name, .. } if name == "linked-docs")
+        }));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tab_path_navigation_tracks_back_and_forward_history() {
         let root = std::env::temp_dir().join(format!(
             "md-viewer-navigation-{}-{}",
@@ -5070,18 +5193,41 @@ mod tests {
         fs::write(&first, "# First").unwrap();
         fs::write(&second, "# Second").unwrap();
 
-        let mut tab = Tab::new(first.canonicalize().unwrap());
-        assert!(tab.navigate_to_path(&second));
+        let mut tab = Tab::new(first.canonicalize().unwrap()).unwrap();
+        assert!(tab.navigate_to_path(&second).unwrap());
         assert_eq!(tab.path, second.canonicalize().unwrap());
         assert!(tab.can_go_back());
         assert!(!tab.can_go_forward());
 
-        tab.navigate_back();
+        assert!(tab.navigate_back().unwrap());
         assert_eq!(tab.path, first.canonicalize().unwrap());
         assert!(tab.can_go_forward());
 
-        tab.navigate_forward();
+        assert!(tab.navigate_forward().unwrap());
         assert_eq!(tab.path, second.canonicalize().unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_history_load_keeps_current_document_and_history() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-navigation-failure-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        fs::write(&first, "# First").unwrap();
+        fs::write(&second, "# Second").unwrap();
+
+        let mut tab = Tab::new(first.clone()).unwrap();
+        assert!(tab.navigate_to_path(&second).unwrap());
+        fs::remove_file(&first).unwrap();
+        assert!(tab.navigate_back().is_err());
+        assert_eq!(tab.path, second.canonicalize().unwrap());
+        assert!(tab.can_go_back());
+        assert!(!tab.can_go_forward());
         fs::remove_dir_all(root).unwrap();
     }
 

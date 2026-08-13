@@ -8,42 +8,42 @@ fn main() {
         commonmark_str!(
             ui,
             &mut cache,
-            "../../../../egui_commonmark/examples/markdown/hello_world.md"
+            "../egui_commonmark/examples/markdown/hello_world.md"
         );
 
         commonmark_str!(
             ui,
             &mut cache,
-            "../../../../egui_commonmark/examples/markdown/headers.md"
+            "../egui_commonmark/examples/markdown/headers.md"
         );
 
         commonmark_str!(
             ui,
             &mut cache,
-            "../../../../egui_commonmark/examples/markdown/lists.md"
+            "../egui_commonmark/examples/markdown/lists.md"
         );
 
         commonmark_str!(
             ui,
             &mut cache,
-            "../../../../egui_commonmark/examples/markdown/code-blocks.md"
+            "../egui_commonmark/examples/markdown/code-blocks.md"
         );
 
         commonmark_str!(
             ui,
             &mut cache,
-            "../../../../egui_commonmark/examples/markdown/blockquotes.md"
+            "../egui_commonmark/examples/markdown/blockquotes.md"
         );
 
         commonmark_str!(
             ui,
             &mut cache,
-            "../../../../egui_commonmark/examples/markdown/tables.md"
+            "../egui_commonmark/examples/markdown/tables.md"
         );
         commonmark_str!(
             ui,
             &mut cache,
-            "../../../../egui_commonmark/examples/markdown/definition_list.md"
+            "../egui_commonmark/examples/markdown/definition_list.md"
         );
     });
 }

@@ -1,11 +1,17 @@
 use crate::alerts::AlertBundle;
 use crate::typography::TypographyConfig;
-use egui::{RichText, TextStyle, Ui, text::LayoutJob};
+use egui::{text::LayoutJob, RichText, TextStyle, Ui};
 use std::collections::HashMap;
 #[cfg(feature = "math")]
 use std::collections::HashSet;
-#[cfg(any(feature = "better_syntax_highlighting", feature = "mermaid"))]
+#[cfg(any(
+    feature = "better_syntax_highlighting",
+    feature = "mermaid",
+    feature = "math"
+))]
 use std::sync::Arc;
+#[cfg(feature = "math")]
+use std::sync::Mutex;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -22,13 +28,16 @@ use syntect::{
     util::LinesWithEndings,
 };
 
-#[cfg(any(feature = "better_syntax_highlighting", feature = "mermaid", feature = "math"))]
+#[cfg(any(
+    feature = "better_syntax_highlighting",
+    feature = "mermaid",
+    feature = "math"
+))]
 use std::sync::LazyLock;
 
 #[cfg(feature = "better_syntax_highlighting")]
 static GLOBAL_SYNTAX_SET: LazyLock<Arc<SyntaxSet>> =
     LazyLock::new(|| Arc::new(SyntaxSet::load_defaults_newlines()));
-
 
 #[cfg(feature = "better_syntax_highlighting")]
 const DEFAULT_THEME_LIGHT: &str = "base16-ocean.light";
@@ -197,12 +206,12 @@ impl Style {
             // Research: Nielsen Norman Group "layer-cake" scanning pattern requires distinct hierarchy
             // H1: 2× base (32px), H2: 1.6× (26px), H3: 1.25× (20px), H4: 1.125× (18px)
             let (size, is_bold) = match level {
-                0 => (base_font_size * 2.0, true),      // H1: 32px (2×)
-                1 => (base_font_size * 1.6, true),     // H2: 26px (1.6×)
-                2 => (base_font_size * 1.25, true),    // H3: 20px (1.25×)
-                3 => (base_font_size * 1.125, true),   // H4: 18px (1.125×)
-                4 => (base_font_size, false),          // H5: 16px (base, no bold)
-                _ => (base_font_size * 0.875, false),  // H6: 14px (0.875×, no bold)
+                0 => (base_font_size * 2.0, true),    // H1: 32px (2×)
+                1 => (base_font_size * 1.6, true),    // H2: 26px (1.6×)
+                2 => (base_font_size * 1.25, true),   // H3: 20px (1.25×)
+                3 => (base_font_size * 1.125, true),  // H4: 18px (1.125×)
+                4 => (base_font_size, false),         // H5: 16px (base, no bold)
+                _ => (base_font_size * 0.875, false), // H6: 14px (0.875×, no bold)
             };
 
             rich_text = rich_text.size(size);
@@ -335,8 +344,10 @@ mod tests {
         // Issue #39: md-viewer opts into a registered bold face so markdown
         // strong/bold produces an inspectable font formatting change.
         egui::__run_test_ui(|ui| {
-            let mut options = CommonMarkOptions::default();
-            options.use_strong_font_family = true;
+            let options = CommonMarkOptions {
+                use_strong_font_family: true,
+                ..Default::default()
+            };
 
             let plain_format = first_text_format(ui, Style::default().to_richtext(ui, "text"));
             let strong_format = first_text_format(
@@ -369,13 +380,9 @@ mod tests {
         ];
 
         for latex in formulas {
-            let rendered = render_math_formula(
-                latex,
-                false,
-                egui::Color32::BLACK,
-                egui::Color32::WHITE,
-            )
-            .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
+            let rendered =
+                render_math_formula(latex, false, egui::Color32::BLACK, egui::Color32::WHITE)
+                    .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
 
             assert!(rendered.size.x > 0.0);
             assert!(rendered.size.y > 0.0);
@@ -392,13 +399,9 @@ mod tests {
         ];
 
         for latex in formulas {
-            let rendered = render_math_formula(
-                latex,
-                false,
-                egui::Color32::BLACK,
-                egui::Color32::WHITE,
-            )
-            .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
+            let rendered =
+                render_math_formula(latex, false, egui::Color32::BLACK, egui::Color32::WHITE)
+                    .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
 
             assert!(rendered.size.x > 0.0);
             assert!(rendered.size.y > 0.0);
@@ -418,7 +421,11 @@ mod tests {
         .unwrap();
         let [width, height] = rendered.image.size;
         let ink_rows: Vec<usize> = (0..height)
-            .filter(|y| rendered.image.pixels[y * width..(y + 1) * width].iter().any(|p| *p != bg))
+            .filter(|y| {
+                rendered.image.pixels[y * width..(y + 1) * width]
+                    .iter()
+                    .any(|p| *p != bg)
+            })
             .collect();
         let top = *ink_rows.first().expect("formula has ink");
         let bottom = *ink_rows.last().expect("formula has ink");
@@ -442,14 +449,9 @@ mod tests {
         }
 
         let render = |latex| {
-            render_math_formula(
-                latex,
-                true,
-                egui::Color32::BLACK,
-                egui::Color32::WHITE,
-            )
-            .unwrap()
-            .image
+            render_math_formula(latex, true, egui::Color32::BLACK, egui::Color32::WHITE)
+                .unwrap()
+                .image
         };
         let first = render(r"\text{在}");
         let second = render(r"\text{中}");
@@ -465,8 +467,10 @@ mod tests {
         // Even with md-viewer's strong-font opt-in, strong inline code should
         // keep the same monospace/code font family as normal inline code.
         egui::__run_test_ui(|ui| {
-            let mut options = CommonMarkOptions::default();
-            options.use_strong_font_family = true;
+            let options = CommonMarkOptions {
+                use_strong_font_family: true,
+                ..Default::default()
+            };
 
             let code_format = first_text_format(
                 ui,
@@ -517,7 +521,7 @@ impl Link {
         // Apply underline and hyperlink color to all sections for better visibility
         let link_color = ui.visuals().hyperlink_color;
         for section in &mut layout_job.sections {
-            section.format.underline = egui::Stroke::new(1.0, link_color);
+            section.format.underline = egui::Stroke::new(1.0_f32, link_color);
             section.format.color = link_color;
             // Remove extra line height to bring underline closer to text
             section.format.line_height = None;
@@ -553,6 +557,7 @@ impl Link {
 pub struct Image {
     pub uri: String,
     pub alt_text: Vec<RichText>,
+    source_start: Option<usize>,
 }
 
 impl Image {
@@ -572,7 +577,13 @@ impl Image {
         Self {
             uri,
             alt_text: Vec::new(),
+            source_start: None,
         }
+    }
+
+    pub fn with_source_start(mut self, source_start: usize) -> Self {
+        self.source_start = Some(source_start);
+        self
     }
 
     pub fn end(self, ui: &mut Ui, cache: &mut CommonMarkCache, options: &CommonMarkOptions) {
@@ -582,6 +593,7 @@ impl Image {
                 .max_width(options.max_width(ui))
                 .sense(egui::Sense::click()),
         );
+        cache.observe_image_size(&self.uri, self.source_start, response.rect.size());
 
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -786,7 +798,9 @@ impl CodeBlock {
         let hash = hasher.finish();
 
         // Poll for completed background renders
+        let mut received_any = false;
         while let Ok(result) = cache.mermaid_rx.try_recv() {
+            received_any = true;
             // Clear the rendering slot if this result is from the active thread
             if cache.mermaid_rendering == Some(result.hash) {
                 cache.mermaid_rendering = None;
@@ -807,14 +821,20 @@ impl CodeBlock {
                     );
                 }
                 Err(err) => {
-                    cache.mermaid_states.insert(result.hash, MermaidState::Error(err));
+                    cache
+                        .mermaid_states
+                        .insert(result.hash, MermaidState::Error(err));
                 }
             }
         }
+        if received_any {
+            cache.mark_layout_changed();
+            ui.ctx().request_repaint();
+        }
 
         // First encounter: insert as Rendering placeholder, spawn only if slot is free
-        if !cache.mermaid_states.contains_key(&hash) {
-            cache.mermaid_states.insert(hash, MermaidState::Rendering);
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.mermaid_states.entry(hash) {
+            entry.insert(MermaidState::Rendering);
 
             if cache.mermaid_rendering.is_none() {
                 Self::spawn_mermaid_render(hash, &self.content, cache);
@@ -824,8 +844,10 @@ impl CodeBlock {
         // Promote: if this diagram is waiting and no thread is active, spawn now.
         // Since egui processes blocks in document order, the first Rendering block
         // encountered after the slot clears is always the topmost waiting one.
-        if matches!(cache.mermaid_states.get(&hash), Some(MermaidState::Rendering))
-            && cache.mermaid_rendering.is_none()
+        if matches!(
+            cache.mermaid_states.get(&hash),
+            Some(MermaidState::Rendering)
+        ) && cache.mermaid_rendering.is_none()
         {
             Self::spawn_mermaid_render(hash, &self.content, cache);
         }
@@ -837,8 +859,7 @@ impl CodeBlock {
             Some(MermaidState::Rendering) => {
                 // Placeholder with loading text
                 let w = max_width.min(options.max_width(ui));
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(w, 200.0), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 200.0), egui::Sense::hover());
                 if ui.is_rect_visible(rect) {
                     ui.painter()
                         .rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
@@ -951,14 +972,13 @@ impl CodeBlock {
                     }
                 }
                 remaining = &after_eq[end..];
-            } else if after.starts_with(':') {
+            } else if let Some(after_colon) = after.strip_prefix(':') {
                 // CSS property: font-family: ...; or font-family:...;
                 result.push_str("font-family: ");
                 result.push_str(safe_css);
                 // Skip colon, optional whitespace, and value until ; or }
-                let after_colon = &after[1..];
                 let trimmed = after_colon.trim_start();
-                if let Some(end) = trimmed.find(|c: char| c == ';' || c == '}') {
+                if let Some(end) = trimmed.find([';', '}']) {
                     remaining = &trimmed[end..];
                 } else {
                     remaining = "";
@@ -974,7 +994,7 @@ impl CodeBlock {
         // Set default font-family on root <svg> so text without explicit
         // font-family (e.g. sequence diagram labels) inherits a consistent font.
         if let Some(svg_pos) = result.find("<svg ") {
-            if !result[svg_pos..].starts_with(&format!("<svg font-family")) {
+            if !result[svg_pos..].starts_with("<svg font-family") {
                 let insert_pos = svg_pos + 5; // after "<svg "
                 result.insert_str(insert_pos, &format!("font-family=\"{}\" ", safe_attr));
             }
@@ -1091,7 +1111,9 @@ impl CodeBlock {
 
         while let Some(text_start) = remaining.find("<text") {
             let text_rest = &remaining[text_start..];
-            let Some(open_end) = text_rest.find('>') else { break };
+            let Some(open_end) = text_rest.find('>') else {
+                break;
+            };
 
             // Capture the first <text ...> tag as template (all share same attrs)
             if open_tag_template.is_empty() {
@@ -1099,14 +1121,18 @@ impl CodeBlock {
             }
 
             let inner = &text_rest[open_end + 1..];
-            let Some(close_pos) = inner.find("</text>") else { break };
+            let Some(close_pos) = inner.find("</text>") else {
+                break;
+            };
             let inner_content = &inner[..close_pos];
 
             // Extract tspan content
             let mut tspan_remaining = inner_content;
             while let Some(ts) = tspan_remaining.find("<tspan") {
                 let ts_rest = &tspan_remaining[ts..];
-                let Some(ts_close) = ts_rest.find("</tspan>") else { break };
+                let Some(ts_close) = ts_rest.find("</tspan>") else {
+                    break;
+                };
                 let full_tspan = &ts_rest[..ts_close + 8];
 
                 if x_val.is_empty() {
@@ -1217,12 +1243,104 @@ struct MathRenderResult {
 }
 
 #[cfg(feature = "math")]
+#[derive(Clone)]
 struct MathRendered {
     image: egui::ColorImage,
     size: egui::Vec2,
     /// Baseline position as a fraction of image height from the top.
     baseline_ratio: f32,
 }
+
+#[cfg(feature = "math")]
+#[derive(Default)]
+struct GlobalMathCache {
+    entries: HashMap<u64, (MathRendered, u64)>,
+    use_tick: u64,
+}
+
+#[cfg(feature = "math")]
+static GLOBAL_MATH_CACHE: LazyLock<Mutex<GlobalMathCache>> =
+    LazyLock::new(|| Mutex::new(GlobalMathCache::default()));
+
+#[cfg(feature = "math")]
+const MAX_GLOBAL_MATH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(feature = "math")]
+fn cached_or_render_math(job: &MathJob) -> Result<MathRendered, String> {
+    if let Ok(mut cache) = GLOBAL_MATH_CACHE.lock() {
+        cache.use_tick = cache.use_tick.wrapping_add(1);
+        let tick = cache.use_tick;
+        if let Some((rendered, last_used)) = cache.entries.get_mut(&job.hash) {
+            *last_used = tick;
+            return Ok(rendered.clone());
+        }
+    }
+
+    let rendered = render_math_formula(&job.latex, job.is_inline, job.fg, job.bg)?;
+    if let Ok(mut cache) = GLOBAL_MATH_CACHE.lock() {
+        cache.use_tick = cache.use_tick.wrapping_add(1);
+        let tick = cache.use_tick;
+        cache.entries.insert(job.hash, (rendered.clone(), tick));
+        while cache
+            .entries
+            .values()
+            .map(|(entry, _)| entry.image.pixels.len() * std::mem::size_of::<egui::Color32>())
+            .sum::<usize>()
+            > MAX_GLOBAL_MATH_CACHE_BYTES
+        {
+            let victim = cache
+                .entries
+                .iter()
+                .filter(|(hash, _)| **hash != job.hash)
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(hash, _)| *hash);
+            let Some(victim) = victim else { break };
+            cache.entries.remove(&victim);
+        }
+    }
+    Ok(rendered)
+}
+
+#[cfg(feature = "math")]
+struct MathJob {
+    hash: u64,
+    latex: String,
+    is_inline: bool,
+    fg: egui::Color32,
+    bg: egui::Color32,
+    result_tx: mpsc::Sender<MathRenderResult>,
+}
+
+/// Shared bounded worker pool. Formula compilation is CPU-heavy, so creating
+/// a fresh OS thread for every formula adds avoidable latency and memory use.
+#[cfg(feature = "math")]
+static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::sync_channel::<MathJob>(64);
+    let rx = Arc::new(Mutex::new(rx));
+    for worker in 0..math_concurrency() {
+        let rx = Arc::clone(&rx);
+        let spawn = std::thread::Builder::new()
+            .name(format!("markdown-math-{worker}"))
+            .spawn(move || loop {
+                let job = match rx.lock() {
+                    Ok(receiver) => match receiver.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    },
+                    Err(_) => break,
+                };
+                let result = cached_or_render_math(&job);
+                let _ = job.result_tx.send(MathRenderResult {
+                    hash: job.hash,
+                    result,
+                });
+            });
+        if spawn.is_err() {
+            break;
+        }
+    }
+    tx
+});
 
 /// Typst preamble defining mitex helper functions needed to compile mitex output.
 /// These map mitex's custom function names to standard Typst math functions.
@@ -1299,32 +1417,41 @@ static MATH_FONTS: LazyLock<Vec<typst::text::Font>> = LazyLock::new(|| {
         .filter_map(|slot| slot.get())
         .collect();
 
-    // `\text{...}` inside formulas can contain CJK prose. Typst's embedded
-    // math fonts cover Latin and mathematical glyphs but not CJK, which would
-    // otherwise render as identical tofu boxes. Ask fontconfig for one generic
-    // Chinese sans-serif fallback and load only that file. This keeps startup
-    // fast and portable across Linux distributions without hard-coding a Noto,
-    // Source Han, WenQuanYi, or distro-specific font path/name.
-    let fallback_path = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}\n", "sans-serif:lang=zh-cn"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .filter(|path| !path.is_empty())
-                .map(str::to_owned)
-        });
-    if let Some(path) = fallback_path {
-        if let Ok(data) = std::fs::read(path) {
-            fonts.extend(typst::text::Font::iter(typst::foundations::Bytes::new(data)));
-        }
+    // `\text{...}` inside formulas can contain CJK prose. Discover a face by
+    // glyph coverage through fontdb rather than depending on the external
+    // `fc-match` executable, which is often absent in strict packages and
+    // minimal distributions.
+    if let Some(data) = system_font_data_with_glyph('中') {
+        fonts.extend(typst::text::Font::iter(typst::foundations::Bytes::new(
+            data,
+        )));
     }
 
     fonts
 });
+
+#[cfg(feature = "math")]
+fn system_font_data_with_glyph(required: char) -> Option<Vec<u8>> {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    // A strict Snap stages its private fonts below $SNAP, while the host's
+    // fontconfig uses absolute /usr/share paths inside the base snap. Scan the
+    // staged directory explicitly so the packaged Noto CJK face is visible.
+    if let Some(snap) = std::env::var_os("SNAP") {
+        database.load_fonts_dir(std::path::Path::new(&snap).join("usr/share/fonts"));
+    }
+    let id = database.faces().find_map(|face| {
+        database
+            .with_face_data(face.id, |bytes, face_index| {
+                ttf_parser::Face::parse(bytes, face_index)
+                    .ok()
+                    .is_some_and(|font| font.glyph_index(required).is_some())
+            })
+            .unwrap_or(false)
+            .then_some(face.id)
+    })?;
+    database.with_face_data(id, |bytes, _| bytes.to_vec())
+}
 
 /// Number of formulas to render (and fonts to load) concurrently. typst
 /// compilation is CPU-bound, so we cap at the core count (bounded to keep
@@ -1535,10 +1662,7 @@ fn render_math_formula(
         }
     }
     let pixels = pixmap.data();
-    let colors: Vec<egui::Color32> = pixels
-        .chunks_exact(4)
-        .map(|c| lut[c[3] as usize])
-        .collect();
+    let colors: Vec<egui::Color32> = pixels.chunks_exact(4).map(|c| lut[c[3] as usize]).collect();
 
     let image = egui::ColorImage {
         size: [w, h],
@@ -1559,7 +1683,8 @@ fn math_cache_hash(ui: &egui::Ui, latex: &str, is_inline: bool) -> u64 {
     let mut hasher = DefaultHasher::new();
     latex.hash(&mut hasher);
     is_inline.hash(&mut hasher);
-    ui.style().visuals.dark_mode.hash(&mut hasher);
+    ui.visuals().text_color().hash(&mut hasher);
+    ui.visuals().panel_fill.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1568,9 +1693,9 @@ fn inline_math_box_height(ui: &egui::Ui, size: egui::Vec2, baseline_ratio: f32) 
     let body_font = egui::TextStyle::Body.resolve(ui.style());
     let font_size = body_font.size;
     let line_height = font_size * 1.5;
-    let ref_galley =
-        ui.painter()
-            .layout_no_wrap("x".to_owned(), body_font, egui::Color32::WHITE);
+    let ref_galley = ui
+        .painter()
+        .layout_no_wrap("x".to_owned(), body_font, egui::Color32::WHITE);
     let font_ascent = ref_galley
         .rows
         .first()
@@ -1600,12 +1725,7 @@ pub fn cached_inline_math_height(
 /// Public function to render math from the callback. Called from the `render_math_fn` closure.
 /// Handles caching and background rendering following the mermaid pattern.
 #[cfg(feature = "math")]
-pub fn render_math(
-    ui: &mut egui::Ui,
-    cache: &mut CommonMarkCache,
-    latex: &str,
-    is_inline: bool,
-) {
+pub fn render_math(ui: &mut egui::Ui, cache: &mut CommonMarkCache, latex: &str, is_inline: bool) {
     render_math_with_layout(ui, cache, latex, is_inline, true);
 }
 
@@ -1661,14 +1781,15 @@ fn render_math_with_layout(
     // the next formula spawns now instead of waiting for the 100ms placeholder
     // tick — otherwise throughput is capped at slots-per-100ms, not render speed.
     if received_any {
+        cache.mark_layout_changed();
         ui.ctx().request_repaint();
     }
 
     // First encounter: insert placeholder
-    if !cache.math_states.contains_key(&hash) {
-        cache.math_states.insert(hash, MathState::Rendering);
-    }
-
+    cache
+        .math_states
+        .entry(hash)
+        .or_insert(MathState::Rendering);
     // Spawn if this formula is still waiting, isn't already being rendered, and
     // a concurrency slot is free. Multiple formulas render in parallel.
     if matches!(cache.math_states.get(&hash), Some(MathState::Rendering))
@@ -1681,14 +1802,13 @@ fn render_math_with_layout(
     // Display based on current state
     match cache.math_states.get(&hash) {
         Some(MathState::Rendering) => {
-            if is_inline && align_to_text_baseline {
+            if is_inline {
                 // Inline: small placeholder
                 ui.spinner();
             } else {
                 // Display: placeholder box
                 let w = ui.available_width().min(400.0);
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(w, 40.0), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 40.0), egui::Sense::hover());
                 if ui.is_rect_visible(rect) {
                     ui.painter()
                         .rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
@@ -1710,7 +1830,7 @@ fn render_math_with_layout(
             baseline_ratio,
         }) => {
             let sized_texture = egui::load::SizedTexture::new(texture.id(), *size);
-            if is_inline {
+            if is_inline && align_to_text_baseline {
                 // Align the formula's own baseline to the text baseline. Inline
                 // content lays out bottom-aligned, so by default the image bottom
                 // sits at the line bottom and the formula's baseline (at a
@@ -1739,8 +1859,10 @@ fn render_math_with_layout(
                 // font's *natural* height (≈1.2× size), which is why using it
                 // left formulas ~1px low.
                 let allocated_height = inline_math_box_height(ui, *size, *baseline_ratio);
-                let (rect, _) = ui
-                    .allocate_exact_size(egui::vec2(size.x, allocated_height), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(size.x, allocated_height),
+                    egui::Sense::hover(),
+                );
                 img.paint_at(ui, egui::Rect::from_min_size(rect.min, *size));
             } else if is_inline {
                 ui.add(egui::Image::new(egui::ImageSource::Texture(sized_texture)));
@@ -1783,14 +1905,17 @@ fn spawn_math_render(
     bg: egui::Color32,
     cache: &mut CommonMarkCache,
 ) {
-    cache.math_rendering.insert(hash);
-    let latex = latex.to_owned();
-    let tx = cache.math_tx.clone();
-
-    std::thread::spawn(move || {
-        let result = render_math_formula(&latex, is_inline, fg, bg);
-        let _ = tx.send(MathRenderResult { hash, result });
-    });
+    let job = MathJob {
+        hash,
+        latex: latex.to_owned(),
+        is_inline,
+        fg,
+        bg,
+        result_tx: cache.math_tx.clone(),
+    };
+    if MATH_JOB_TX.try_send(job).is_ok() {
+        cache.math_rendering.insert(hash);
+    }
 }
 
 #[cfg(not(feature = "better_syntax_highlighting"))]
@@ -1873,7 +1998,12 @@ impl CodeBlock {
     }
 }
 
-fn simple_highlighting(ui: &Ui, text: &str, extension: &str, code_line_height: Option<f32>) -> egui::text::LayoutJob {
+fn simple_highlighting(
+    ui: &Ui,
+    text: &str,
+    extension: &str,
+    code_line_height: Option<f32>,
+) -> egui::text::LayoutJob {
     let mut job = egui_extras::syntax_highlighting::highlight(
         ui.ctx(),
         ui.style(),
@@ -1919,6 +2049,8 @@ fn default_theme(ui: &Ui) -> &str {
 }
 
 /// A cache used for storing content such as images.
+type CachedEvents = Vec<(pulldown_cmark::Event<'static>, std::ops::Range<usize>)>;
+
 pub struct CommonMarkCache {
     // Everything stored in `CommonMarkCache` must take into account that
     // the cache is for multiple `CommonMarkviewer`s with different source_ids.
@@ -1934,7 +2066,7 @@ pub struct CommonMarkCache {
 
     /// Cached parsed markdown events to avoid re-parsing every frame.
     /// Keyed by a hash of the source text. Cleared when cache is reset.
-    cached_events: Option<(u64, Vec<(pulldown_cmark::Event<'static>, std::ops::Range<usize>)>)>,
+    cached_events: Option<(u64, CachedEvents)>,
 
     /// Cached syntect LayoutJobs for code blocks, keyed by
     /// (content_hash, lang, theme_is_dark, mono_font_size).
@@ -1960,6 +2092,9 @@ pub struct CommonMarkCache {
     /// estimates are unreliable in image-heavy documents.
     active_search_y: Option<f32>,
 
+    /// Incremented when asynchronous render results can change document height.
+    layout_revision: u64,
+
     /// Mermaid diagram render states: content hash → rendering/ready/error
     #[cfg(feature = "mermaid")]
     mermaid_states: HashMap<u64, MermaidState>,
@@ -1983,6 +2118,11 @@ pub struct CommonMarkCache {
     /// Set when a regular image is clicked (texture id + intrinsic size for lightbox).
     /// Texture lifetime is owned by egui's loader, so we only carry the id.
     clicked_image: Option<(egui::TextureId, egui::Vec2)>,
+
+    /// Last allocated size of each ordinary image. Loader completion can
+    /// replace a placeholder with a differently sized image after viewport
+    /// split points have been recorded.
+    image_sizes: HashMap<(String, Option<usize>), egui::Vec2>,
 
     /// Hash of the diagram that currently has an active background thread.
     /// Only one diagram renders at a time so they appear top-to-bottom.
@@ -2049,6 +2189,7 @@ impl Default for CommonMarkCache {
             search_ranges: Vec::new(),
             active_search_range: None,
             active_search_y: None,
+            layout_revision: 0,
             #[cfg(feature = "mermaid")]
             mermaid_states: HashMap::new(),
             #[cfg(feature = "mermaid")]
@@ -2056,17 +2197,19 @@ impl Default for CommonMarkCache {
             #[cfg(feature = "mermaid")]
             mermaid_rx,
             #[cfg(feature = "mermaid")]
-            mermaid_renderer: merman::render::HeadlessRenderer::new()
-                .with_text_measurer(Arc::new(merman::render::DeterministicTextMeasurer {
+            mermaid_renderer: merman::render::HeadlessRenderer::new().with_text_measurer(Arc::new(
+                merman::render::DeterministicTextMeasurer {
                     // Wider than default (0.55) to accommodate Noto Sans/DejaVu Sans
                     // which are wider than the vendored Trebuchet MS metrics.
                     // 0.65 prevents text overlap in complex flowcharts with long labels.
                     char_width_factor: 0.65,
                     line_height_factor: 0.0, // use internal default
-                })),
+                },
+            )),
             #[cfg(feature = "mermaid")]
             clicked_mermaid: None,
             clicked_image: None,
+            image_sizes: HashMap::new(),
             #[cfg(feature = "mermaid")]
             mermaid_rendering: None,
             #[cfg(feature = "math")]
@@ -2230,7 +2373,8 @@ impl CommonMarkCache {
     /// The `normalized_key` should be a pre-computed lowercase key for the header title.
     pub fn record_header_position(&mut self, normalized_key: &str, viewport_y: f32) {
         let content_y = self.current_scroll_offset + viewport_y;
-        self.header_positions.insert(normalized_key.to_string(), content_y);
+        self.header_positions
+            .insert(normalized_key.to_string(), content_y);
     }
 
     /// Record a header's already-content-relative y directly (no offset addition).
@@ -2240,7 +2384,8 @@ impl CommonMarkCache {
     /// is for `show_viewport`, whose cursor is already viewport-relative so
     /// the offset addition is needed.
     pub fn record_header_content_y(&mut self, normalized_key: &str, content_y: f32) {
-        self.header_positions.insert(normalized_key.to_string(), content_y);
+        self.header_positions
+            .insert(normalized_key.to_string(), content_y);
     }
 
     /// Same as `record_header_content_y` but only stores if the key isn't
@@ -2305,6 +2450,26 @@ impl CommonMarkCache {
         self.active_search_y
     }
 
+    pub fn layout_revision(&self) -> u64 {
+        self.layout_revision
+    }
+
+    pub fn mark_layout_changed(&mut self) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
+    }
+
+    fn observe_image_size(&mut self, uri: &str, source_start: Option<usize>, size: egui::Vec2) {
+        match self
+            .image_sizes
+            .insert((uri.to_owned(), source_start), size)
+        {
+            Some(previous) if (previous - size).length_sq() > 0.25 => {
+                self.mark_layout_changed();
+            }
+            _ => {}
+        }
+    }
+
     /// Read-only view of stored search ranges (used by the renderer).
     pub fn search_ranges(&self) -> &[std::ops::Range<usize>] {
         &self.search_ranges
@@ -2316,7 +2481,10 @@ impl CommonMarkCache {
     }
 
     /// Get cached parsed events if the content hash matches.
-    pub fn get_cached_events(&self, content_hash: u64) -> Option<&[(pulldown_cmark::Event<'static>, std::ops::Range<usize>)]> {
+    pub fn get_cached_events(
+        &self,
+        content_hash: u64,
+    ) -> Option<&[(pulldown_cmark::Event<'static>, std::ops::Range<usize>)]> {
         self.cached_events.as_ref().and_then(|(hash, events)| {
             if *hash == content_hash {
                 Some(events.as_slice())
@@ -2327,7 +2495,11 @@ impl CommonMarkCache {
     }
 
     /// Store parsed events in the cache.
-    pub fn set_cached_events(&mut self, content_hash: u64, events: Vec<(pulldown_cmark::Event<'static>, std::ops::Range<usize>)>) {
+    pub fn set_cached_events(
+        &mut self,
+        content_hash: u64,
+        events: Vec<(pulldown_cmark::Event<'static>, std::ops::Range<usize>)>,
+    ) {
         self.cached_events = Some((content_hash, events));
     }
 }

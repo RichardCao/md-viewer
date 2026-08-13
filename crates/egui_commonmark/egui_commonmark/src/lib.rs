@@ -3,7 +3,7 @@
 //! # Example
 //!
 //! ```
-//! # use egui_commonmark::*;
+//! # use egui_commonmark_extended::*;
 //! # use egui::__run_test_ui;
 //! let markdown =
 //! r"# Hello world
@@ -47,7 +47,7 @@
 //! ## Example
 //!
 //! ```
-//! use egui_commonmark::{CommonMarkCache, commonmark};
+//! use egui_commonmark_extended::{CommonMarkCache, commonmark};
 //! # egui::__run_test_ui(|ui| {
 //! let mut cache = CommonMarkCache::default();
 //! let _response = commonmark!(ui, &mut cache, "# ATX Heading Level 1");
@@ -60,7 +60,7 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use egui_commonmark::{CommonMarkCache, commonmark_str};
+//! use egui_commonmark_extended::{CommonMarkCache, commonmark_str};
 //! # egui::__run_test_ui(|ui| {
 //! let mut cache = CommonMarkCache::default();
 //! commonmark_str!(ui, &mut cache, "content.md");
@@ -78,17 +78,17 @@ use egui::{self, Id};
 mod mime_svg_loader;
 mod parsers;
 
-pub use egui_commonmark_backend_extended::RenderHtmlFn;
-pub use egui_commonmark_backend_extended::RenderMathFn;
 pub use egui_commonmark_backend_extended::alerts::{Alert, AlertBundle};
 pub use egui_commonmark_backend_extended::misc::{CommonMarkCache, STRONG_FONT_FAMILY};
 pub use egui_commonmark_backend_extended::typography::{Measurement, TypographyConfig};
 #[cfg(feature = "math")]
+pub use egui_commonmark_backend_extended::warm_math_fonts;
+pub use egui_commonmark_backend_extended::RenderHtmlFn;
+pub use egui_commonmark_backend_extended::RenderMathFn;
+#[cfg(feature = "math")]
 pub use egui_commonmark_backend_extended::{
     cached_inline_math_height, render_math, render_math_in_table,
 };
-#[cfg(feature = "math")]
-pub use egui_commonmark_backend_extended::warm_math_fonts;
 
 #[cfg(feature = "macros")]
 pub use egui_commonmark_macros_extended::*;
@@ -161,7 +161,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().default_implicit_uri_scheme("https://example.org/");
     /// ```
     pub fn default_implicit_uri_scheme<S: Into<String>>(mut self, scheme: S) -> Self {
@@ -211,7 +211,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// ```
     /// # use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// let mut math_images = Rc::new(RefCell::new(HashMap::new()));
     /// CommonMarkViewer::new()
     ///     .render_math_fn(Some(&move |ui, math, inline| {
@@ -268,7 +268,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().line_height(1.5); // 150% of font size
     /// ```
     pub fn line_height(mut self, multiplier: f32) -> Self {
@@ -280,7 +280,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().line_height_px(24.0); // 24 pixels
     /// ```
     pub fn line_height_px(mut self, pixels: f32) -> Self {
@@ -294,7 +294,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().paragraph_spacing(1.5); // 150% of font size
     /// ```
     pub fn paragraph_spacing(mut self, multiplier: f32) -> Self {
@@ -306,7 +306,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().paragraph_spacing_px(24.0); // 24 pixels
     /// ```
     pub fn paragraph_spacing_px(mut self, pixels: f32) -> Self {
@@ -320,7 +320,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().heading_spacing_above(2.0); // 200% of font size
     /// ```
     pub fn heading_spacing_above(mut self, multiplier: f32) -> Self {
@@ -332,7 +332,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().heading_spacing_above_px(32.0); // 32 pixels
     /// ```
     pub fn heading_spacing_above_px(mut self, pixels: f32) -> Self {
@@ -346,7 +346,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().heading_spacing_below(0.5); // 50% of font size
     /// ```
     pub fn heading_spacing_below(mut self, multiplier: f32) -> Self {
@@ -358,7 +358,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().heading_spacing_below_px(8.0); // 8 pixels
     /// ```
     pub fn heading_spacing_below_px(mut self, pixels: f32) -> Self {
@@ -373,7 +373,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().code_line_height(1.3); // 130% of font size
     /// ```
     pub fn code_line_height(mut self, multiplier: f32) -> Self {
@@ -385,7 +385,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().code_line_height_px(18.0); // 18 pixels
     /// ```
     pub fn code_line_height_px(mut self, pixels: f32) -> Self {
@@ -404,7 +404,7 @@ impl<'f> CommonMarkViewer<'f> {
     ///
     /// # Example
     /// ```
-    /// # use egui_commonmark::CommonMarkViewer;
+    /// # use egui_commonmark_extended::CommonMarkViewer;
     /// CommonMarkViewer::new().typography_recommended();
     /// ```
     pub fn typography_recommended(mut self) -> Self {

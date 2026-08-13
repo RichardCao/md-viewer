@@ -1,7 +1,7 @@
 use std::iter::Peekable;
 
 use egui_commonmark_backend_extended::{
-    CodeBlock, CommonMarkOptions, Image, alerts::Alert, misc::Style, pulldown::*,
+    alerts::Alert, misc::Style, pulldown::*, CodeBlock, CommonMarkOptions, Image,
 };
 
 use proc_macro2::TokenStream;
@@ -834,11 +834,11 @@ impl CommonMarkViewerInternal {
             stream.extend(if let Some(lang) = block.lang {
                 quote!(egui_commonmark_backend_extended::CodeBlock {
                     lang: Some(#lang.to_owned()), content: #content.to_owned()}
-                    .end(ui, #cache, &options, max_width);)
+                    .end(ui, #cache, &options, max_width, ui.next_auto_id());)
             } else {
                 quote!(egui_commonmark_backend_extended::CodeBlock {
                     lang: None, content: #content.to_owned()}
-                    .end(ui, #cache, &options, max_width);)
+                    .end(ui, #cache, &options, max_width, ui.next_auto_id());)
             });
 
             stream.extend(self.line.try_insert_end());

@@ -78,7 +78,7 @@ use generator::*;
 
 use quote::quote_spanned;
 use syn::parse::{Parse, ParseStream, Result};
-use syn::{Expr, LitStr, Token, parse_macro_input};
+use syn::{parse_macro_input, Expr, LitStr, Token};
 
 struct Parameters {
     ui: Expr,
@@ -145,7 +145,18 @@ pub fn commonmark_str(input: proc_macro::TokenStream) -> proc_macro::TokenStream
         proc_macro::tracked_path::path(&path);
     }
 
-    let Ok(md) = std::fs::read_to_string(path) else {
+    let candidates = [
+        std::path::PathBuf::from(&path),
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(&path),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&path),
+    ];
+    let Some(md) = candidates
+        .iter()
+        .find_map(|candidate| std::fs::read_to_string(candidate).ok())
+    else {
         return quote_spanned!(markdown.span()=>
             compile_error!("Could not find markdown file");
         )

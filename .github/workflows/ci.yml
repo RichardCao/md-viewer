@@ -29,6 +29,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Remove local-only MCP dependency
@@ -43,6 +46,31 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo build --release
       - run: cargo test
+      - name: Check minimum supported Rust version
+        run: cargo +1.89.0 check --locked
+
+      # The vendored renderer is a nested workspace and is not covered by the
+      # root Cargo commands above. Test the exact feature set used by md-viewer.
+      - name: Check vendored renderer formatting
+        run: cargo fmt --manifest-path crates/egui_commonmark/Cargo.toml --all -- --check
+      - name: Lint vendored renderer
+        run: |
+          FEATURES=better_syntax_highlighting,svg,svg_text,load-images,fetch,mermaid,math,macros
+          cargo clippy --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_extended --all-targets --features "$FEATURES" -- -D warnings
+          cargo clippy --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_backend_extended --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_macros_extended --all-targets -- -D warnings
+      - name: Test vendored renderer
+        run: |
+          FEATURES=better_syntax_highlighting,svg,svg_text,load-images,fetch,mermaid,math,macros
+          cargo test --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_extended --features "$FEATURES"
+          cargo test --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_backend_extended --all-features
+          cargo test --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_macros_extended
+      - name: Check vendored renderer minimum supported Rust version
+        run: |
+          FEATURES=better_syntax_highlighting,svg,svg_text,load-images,fetch,mermaid,math,macros
+          cargo +1.89.0 check --locked --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_extended --features "$FEATURES"
+          cargo +1.89.0 check --locked --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_backend_extended --all-features
+          cargo +1.89.0 check --locked --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_macros_extended
 
   version-sync:
     runs-on: ubuntu-latest
