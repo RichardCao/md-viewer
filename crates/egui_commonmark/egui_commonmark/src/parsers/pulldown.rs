@@ -244,6 +244,35 @@ fn cell_visual_lines(cell: &[(pulldown_cmark::Event, Range<usize>)]) -> usize {
     max_lines
 }
 
+fn table_cell_height(
+    cell: &[(pulldown_cmark::Event, Range<usize>)],
+    line_height: f32,
+    cache: &CommonMarkCache,
+    ui: &Ui,
+) -> f32 {
+    let default_height = line_height * 1.5 * cell_visual_lines(cell) as f32;
+    let mut height = default_height;
+
+    for (event, _) in cell {
+        if let pulldown_cmark::Event::InlineMath(tex) = event {
+            // Inline math is rasterized asynchronously and can be taller than
+            // a text row (fractions, sums, stacked scripts). Reserve two text
+            // lines immediately, then use the exact cached image box height on
+            // later repaints. Padding keeps the table borders off the glyphs.
+            let conservative = line_height * 2.0;
+            #[cfg(feature = "math")]
+            let formula_height = crate::cached_inline_math_height(ui, cache, tex)
+                .map(|exact| exact + line_height * 0.5)
+                .unwrap_or(conservative);
+            #[cfg(not(feature = "math"))]
+            let formula_height = conservative;
+            height = height.max(formula_height);
+        }
+    }
+
+    height
+}
+
 /// Heuristic visual-line count for an HTML-table cell (rendered as a plain
 /// `RichText` string, not as a markdown event stream). Counts explicit
 /// newlines and adds a crude wrap estimate of ~60 chars per visual line.
@@ -550,9 +579,18 @@ fn parse_markdown_events(
                 .chars()
                 .next()
                 .expect("source_at is a valid character boundary");
-            normalized.push(ch);
-            for byte_offset in 1..=ch.len_utf8() {
-                original_boundary.push(source_at + byte_offset);
+            if active_math.is_some() && ch == '|' {
+                // CommonMark parses pipes before math. Inside a Markdown table,
+                // LaTeX absolute-value bars would therefore split the cell and
+                // leave this and following formulas as raw text. An entity is
+                // invisible to table parsing and is decoded by the math backend.
+                normalized.push_str("&#124;");
+                original_boundary.extend(std::iter::repeat(source_at + 1).take(6));
+            } else {
+                normalized.push(ch);
+                for byte_offset in 1..=ch.len_utf8() {
+                    original_boundary.push(source_at + byte_offset);
+                }
             }
             source_at += ch.len_utf8();
         }
@@ -1371,26 +1409,21 @@ impl CommonMarkViewerInternal {
                 self.line.try_insert_end(ui);
                 return;
             }
-            // Per-line cell height; rows grow taller when cells contain multi-chunk
-            // inline-code wraps (computed below via `cell_visual_lines`).
+            // Per-line cell height; rows grow taller for wrapped code and math.
             let cell_h = line_h * 1.5;
-            // Header is one row; its height grows if any header cell has wrapped code.
-            let header_lines = header
+            let header_h = header
                 .iter()
-                .map(|c| cell_visual_lines(c))
-                .max()
-                .unwrap_or(1);
-            let header_h = cell_h * header_lines as f32;
-            // Pre-compute per-body-row height so multi-chunk cells aren't clipped.
+                .map(|cell| table_cell_height(cell, line_h, cache, ui))
+                .fold(cell_h, f32::max);
+            // Pre-compute per-body-row height so wrapped code and tall formula
+            // images aren't clipped by TableBuilder's fixed row rectangles.
             let body_heights: Vec<f32> = rows
                 .iter()
                 .map(|row| {
-                    let max_lines = row
+                    row
                         .iter()
-                        .map(|c| cell_visual_lines(c))
-                        .max()
-                        .unwrap_or(1);
-                    cell_h * max_lines as f32
+                        .map(|cell| table_cell_height(cell, line_h, cache, ui))
+                        .fold(cell_h, f32::max)
                 })
                 .collect();
             // Outer ScrollArea::horizontal handles the case where columns
@@ -2448,6 +2481,38 @@ escaped \\(literal\\)
     }
 
     #[test]
+    fn latex_math_absolute_value_does_not_split_markdown_tables() {
+        let markdown = concat!(
+            "| name | formula | kind |\n",
+            "|---|---|---|\n",
+            r"| first | \(\operatorname{EW}[|\Delta OI|]\) | native |",
+            "\n",
+            r"| second | \(\int_a^b x\,dx + \mathbf 1\) | research |",
+            "\n",
+        );
+        let events = parse_markdown_events(markdown, true);
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(event, _)| matches!(event, Event::Start(Tag::TableCell)))
+                .count(),
+            9
+        );
+        let formulas: Vec<_> = events
+            .iter()
+            .filter_map(|(event, _)| match event {
+                Event::InlineMath(tex) => Some(tex.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(formulas.len(), 2);
+        assert_eq!(formulas[0], r"\operatorname{EW}[&#124;\Delta OI&#124;]");
+        assert!(formulas[1].contains(r"\int"));
+        assert!(formulas[1].contains(r"\mathbf"));
+    }
+
+    #[test]
     fn registered_markdown_paths_are_detected_as_auto_links() {
         let hooks = std::collections::HashMap::from([
             ("docs/guide.md".to_string(), false),
@@ -2481,6 +2546,17 @@ escaped \\(literal\\)
         );
         assert_eq!(registered_exact_auto_link("#section", &hooks), None);
         assert_eq!(registered_exact_auto_link("guide.md", &hooks), None);
+    }
+
+    #[test]
+    fn table_cells_reserve_extra_height_for_inline_math() {
+        egui::__run_test_ui(|ui| {
+            let cache = CommonMarkCache::default();
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+            let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
+
+            assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
+        });
     }
 
     #[test]

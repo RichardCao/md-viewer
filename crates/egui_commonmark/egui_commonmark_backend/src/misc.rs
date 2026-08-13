@@ -405,6 +405,32 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "math")]
+    #[test]
+    fn inline_fraction_raster_keeps_vertical_ink_margin() {
+        let bg = egui::Color32::BLACK;
+        let rendered = render_math_formula(
+            r"-\frac15\sum_{l=1}^5 P_{a,l}",
+            true,
+            egui::Color32::WHITE,
+            bg,
+        )
+        .unwrap();
+        let [width, height] = rendered.image.size;
+        let ink_rows: Vec<usize> = (0..height)
+            .filter(|y| rendered.image.pixels[y * width..(y + 1) * width].iter().any(|p| *p != bg))
+            .collect();
+        let top = *ink_rows.first().expect("formula has ink");
+        let bottom = *ink_rows.last().expect("formula has ink");
+
+        assert!(top >= 3, "top ink margin too small: {top}px");
+        assert!(
+            height - 1 - bottom >= 3,
+            "bottom ink margin too small: {}px (image height {height})",
+            height - 1 - bottom
+        );
+    }
+
     #[test]
     fn strong_code_keeps_monospace_font_family() {
         // Even with md-viewer's strong-font opt-in, strong inline code should
@@ -1356,8 +1382,6 @@ fn render_math_formula(
     // spacing, so a baked-in x-margin would double the gap around short symbols
     // (`$w$`, `$z$`) and read as "weird spacing". Keep a little vertical margin
     // so glyph extents (e.g. accents, descenders) aren't clipped.
-    let margin = if is_inline { "(x: 0pt, y: 2pt)" } else { "(x: 8pt, y: 6pt)" };
-
     // Inline vs display style. Whitespace inside `$ … $` makes typst render a
     // *block* equation (displaystyle: bigger operators, centered, no inline
     // baseline). `$…$` with no surrounding whitespace is *inline* (textstyle:
@@ -1371,11 +1395,10 @@ fn render_math_formula(
 
     let source = format!(
         r#"{preamble}
-#set page(width: auto, height: auto, margin: {margin}, fill: none)
+#set page(width: auto, height: auto, margin: 0pt, fill: none)
 #set text(size: 16pt, fill: black)
 {equation}"#,
         preamble = MITEX_PREAMBLE,
-        margin = margin,
         equation = equation,
     );
 
@@ -1389,13 +1412,42 @@ fn render_math_formula(
     let result = engine.compile::<typst::layout::PagedDocument>();
     let doc = result.output.map_err(|e| format!("typst: {e}"))?;
 
-    let page = doc.pages.first().ok_or("typst: no pages")?;
+    let mut page = doc.pages.first().ok_or("typst: no pages")?.clone();
 
-    let baseline_ratio = math_baseline_ratio(page);
+    // Auto-sized Typst pages collapse page margins to the formula's layout
+    // bounds. Math glyph ink can extend beyond those bounds (notably fraction
+    // numerators and sum limits), so rendering that page directly clips real
+    // pixels. Expand the finished frame and translate all its vector content
+    // before rasterization; unlike padding the already-rendered bitmap, this
+    // preserves ink that originally lay outside the page frame.
+    let (pad_left, pad_top, pad_right, pad_bottom) = if is_inline {
+        (
+            typst::layout::Abs::zero(),
+            typst::layout::Abs::pt(6.0),
+            typst::layout::Abs::zero(),
+            typst::layout::Abs::pt(9.0),
+        )
+    } else {
+        (
+            typst::layout::Abs::pt(8.0),
+            typst::layout::Abs::pt(6.0),
+            typst::layout::Abs::pt(8.0),
+            typst::layout::Abs::pt(6.0),
+        )
+    };
+    let original_size = page.frame.size();
+    page.frame
+        .translate(typst::layout::Point::new(pad_left, pad_top));
+    page.frame.set_size(typst::layout::Size::new(
+        original_size.x + pad_left + pad_right,
+        original_size.y + pad_top + pad_bottom,
+    ));
+
+    let baseline_ratio = math_baseline_ratio(&page);
 
     // 4. Render directly to pixels via typst-render (no SVG intermediary)
     let pixel_per_pt = 3.0_f32;
-    let pixmap = typst_render::render(page, pixel_per_pt);
+    let pixmap = typst_render::render(&page, pixel_per_pt);
 
     let w = pixmap.width() as usize;
     let h = pixmap.height() as usize;
@@ -1444,6 +1496,49 @@ fn render_math_formula(
     })
 }
 
+#[cfg(feature = "math")]
+fn math_cache_hash(ui: &egui::Ui, latex: &str, is_inline: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    latex.hash(&mut hasher);
+    is_inline.hash(&mut hasher);
+    ui.style().visuals.dark_mode.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(feature = "math")]
+fn inline_math_box_height(ui: &egui::Ui, size: egui::Vec2, baseline_ratio: f32) -> f32 {
+    let body_font = egui::TextStyle::Body.resolve(ui.style());
+    let font_size = body_font.size;
+    let line_height = font_size * 1.5;
+    let ref_galley =
+        ui.painter()
+            .layout_no_wrap("x".to_owned(), body_font, egui::Color32::WHITE);
+    let font_ascent = ref_galley
+        .rows
+        .first()
+        .and_then(|row| row.row.glyphs.first())
+        .map_or(font_size * 0.8, |glyph| glyph.font_ascent);
+    let text_descent = line_height - font_ascent;
+    let image_descent = (1.0 - baseline_ratio) * size.y;
+    size.y + (text_descent - image_descent).max(0.0)
+}
+
+/// Return the exact allocated height of a rendered inline formula when it is
+/// already cached. Fixed-height containers such as tables can use this on the
+/// next repaint to grow beyond their conservative placeholder height.
+#[cfg(feature = "math")]
+pub fn cached_inline_math_height(
+    ui: &egui::Ui,
+    cache: &CommonMarkCache,
+    latex: &str,
+) -> Option<f32> {
+    let hash = math_cache_hash(ui, latex, true);
+    match cache.math_states.get(&hash) {
+        Some(MathState::Ready { size, .. }) => Some(size.y),
+        _ => None,
+    }
+}
+
 /// Public function to render math from the callback. Called from the `render_math_fn` closure.
 /// Handles caching and background rendering following the mermaid pattern.
 #[cfg(feature = "math")]
@@ -1453,16 +1548,30 @@ pub fn render_math(
     latex: &str,
     is_inline: bool,
 ) {
-    let is_dark = ui.style().visuals.dark_mode;
+    render_math_with_layout(ui, cache, latex, is_inline, true);
+}
+
+/// Render inline math inside a vertically centered, fixed-height table cell.
+/// Unlike prose, the cell does not need baseline-lift padding: adding it moves
+/// the image toward the lower border even when the row itself is tall enough.
+#[cfg(feature = "math")]
+pub fn render_math_in_table(ui: &mut egui::Ui, cache: &mut CommonMarkCache, latex: &str) {
+    render_math_with_layout(ui, cache, latex, true, false);
+}
+
+#[cfg(feature = "math")]
+fn render_math_with_layout(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    latex: &str,
+    is_inline: bool,
+    align_to_text_baseline: bool,
+) {
     let bg = ui.visuals().panel_fill;
     let fg = ui.visuals().text_color();
 
-    // Hash content + theme for cache key
-    let mut hasher = DefaultHasher::new();
-    latex.hash(&mut hasher);
-    is_inline.hash(&mut hasher);
-    is_dark.hash(&mut hasher);
-    let hash = hasher.finish();
+    // Hash content + theme for cache key.
+    let hash = math_cache_hash(ui, latex, is_inline);
 
     // Poll for completed background renders
     let mut received_any = false;
@@ -1514,7 +1623,7 @@ pub fn render_math(
     // Display based on current state
     match cache.math_states.get(&hash) {
         Some(MathState::Rendering) => {
-            if is_inline {
+            if is_inline && align_to_text_baseline {
                 // Inline: small placeholder
                 ui.spinner();
             } else {
@@ -1571,23 +1680,12 @@ pub fn render_math(
                 // `line_height: Multiplier(1.5)`); `text_style_height` returns the
                 // font's *natural* height (≈1.2× size), which is why using it
                 // left formulas ~1px low.
-                let body_font = egui::TextStyle::Body.resolve(ui.style());
-                let font_size = body_font.size;
-                let line_height = font_size * 1.5;
-                let ref_galley =
-                    ui.painter()
-                        .layout_no_wrap("x".to_owned(), body_font, egui::Color32::WHITE);
-                let font_ascent = ref_galley
-                    .rows
-                    .first()
-                    .and_then(|r| r.row.glyphs.first())
-                    .map_or(font_size * 0.8, |g| g.font_ascent);
-                let text_descent = line_height - font_ascent;
-                let image_descent = (1.0 - *baseline_ratio) * size.y;
-                let lift = (text_descent - image_descent).max(0.0);
+                let allocated_height = inline_math_box_height(ui, *size, *baseline_ratio);
                 let (rect, _) = ui
-                    .allocate_exact_size(egui::vec2(size.x, size.y + lift), egui::Sense::hover());
+                    .allocate_exact_size(egui::vec2(size.x, allocated_height), egui::Sense::hover());
                 img.paint_at(ui, egui::Rect::from_min_size(rect.min, *size));
+            } else if is_inline {
+                ui.add(egui::Image::new(egui::ImageSource::Texture(sized_texture)));
             } else {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
