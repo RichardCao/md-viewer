@@ -51,9 +51,11 @@ fn has_data_url_scheme(uri: &str) -> bool {
         .trim_start_matches(|ch| ch <= ' ')
         .bytes()
         .filter(|byte| !matches!(byte, b'\t' | b'\n' | b'\r'));
-    b"data:"
-        .iter()
-        .all(|expected| bytes.next().is_some_and(|actual| actual.eq_ignore_ascii_case(expected)))
+    b"data:".iter().all(|expected| {
+        bytes
+            .next()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    })
 }
 
 static DECODE_JOB_TX: LazyLock<mpsc::SyncSender<DecodeJob>> = LazyLock::new(|| {

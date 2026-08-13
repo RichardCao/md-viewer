@@ -79,7 +79,9 @@ mod mime_svg_loader;
 mod parsers;
 
 pub use egui_commonmark_backend_extended::alerts::{Alert, AlertBundle};
-pub use egui_commonmark_backend_extended::misc::{CommonMarkCache, STRONG_FONT_FAMILY};
+pub use egui_commonmark_backend_extended::misc::{
+    header_position_key, CommonMarkCache, STRONG_FONT_FAMILY,
+};
 pub use egui_commonmark_backend_extended::typography::{Measurement, TypographyConfig};
 #[cfg(feature = "math")]
 pub use egui_commonmark_backend_extended::warm_math_fonts;

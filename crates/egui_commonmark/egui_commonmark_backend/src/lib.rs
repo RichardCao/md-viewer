@@ -28,7 +28,7 @@ pub use {
 };
 
 // The only struct that is allowed to use directly. (If one does not need egui_commonmark)
-pub use misc::CommonMarkCache;
+pub use misc::{header_position_key, CommonMarkCache};
 
 #[cfg(feature = "math")]
 pub use misc::{cached_inline_math_height, render_math, render_math_in_table};

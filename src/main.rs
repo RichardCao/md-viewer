@@ -8,13 +8,13 @@ use std::io::{self, IsTerminal};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use egui_commonmark_extended::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark_extended::{header_position_key, CommonMarkCache, CommonMarkViewer};
 use notify::{PollWatcher, RecommendedWatcher};
 use notify_debouncer_mini::{new_debouncer, new_debouncer_opt, DebouncedEventKind, Debouncer};
 use regex::Regex;
@@ -31,13 +31,6 @@ const APP_KEY: &str = "md-viewer-state";
 // Welcome page recent-files: how many to keep, and how many to show before "Show more".
 const RECENT_FILES_CAP: usize = 20;
 const RECENT_SHOWN: usize = 6;
-
-/// Compiled regex for parsing markdown headers (lazy, compiled once)
-static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+)$").unwrap());
-
-/// Inline-code contents are scanned separately so a local path remains
-/// discoverable when it directly touches prose or non-ASCII punctuation.
-static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\r\n]+)`").unwrap());
 
 const MAX_WATCHER_RETRIES: u32 = 3;
 const FLASH_DURATION_MS: u64 = 600;
@@ -61,6 +54,14 @@ const CONTENT_RIGHT_RESIZE_GUTTER: i8 = 10;
 // share the same line/page behavior.
 const KEYBOARD_LINE_SCROLL_STEP: f32 = 48.0;
 const KEYBOARD_PAGE_SCROLL_RATIO: f32 = 0.9;
+
+fn next_watcher_retry(current: u32) -> Option<u32> {
+    if current < MAX_WATCHER_RETRIES {
+        Some(current + 1)
+    } else {
+        None
+    }
+}
 
 // App-level keyboard scroll actions; kept private until shortcut wiring needs
 // to pass them through `MarkdownApp::update`.
@@ -374,32 +375,14 @@ struct PersistedState {
     recent_files: Option<Vec<RecentEntry>>,
 }
 
-/// Build the composite cache key for a header position lookup. Combines the
-/// normalized (lowercased) title with the occurrence index so duplicate-titled
-/// headers map to distinct entries in `CommonMarkCache::header_positions`.
-/// Both the parser (which assigns `nth_with_same_text` to each `Header`) and
-/// the renderer (which records positions while painting) use this function so
-/// keys agree across the read/write boundary.
-pub fn header_position_key(normalized_title: &str, nth_with_same_text: usize) -> String {
-    if nth_with_same_text == 0 {
-        normalized_title.to_string()
-    } else {
-        format!("{normalized_title}#{nth_with_same_text}")
-    }
-}
-
 /// Represents a markdown header for the outline
 #[derive(Clone)]
 struct Header {
     level: u8,
     title: String,
-    /// Pre-computed lowercase key for header position cache lookups
-    normalized_title: String,
-    /// Occurrence index among headers with the same `normalized_title`.
-    /// The first `## Installation` is 0, the second is 1, etc. Combined
-    /// with `normalized_title` into the composite cache key so duplicates
-    /// scroll to the correct (different) y positions.
-    nth_with_same_text: usize,
+    /// Byte offset of the heading's Start event. The renderer records the
+    /// position under the same source-stable key, independent of formatting.
+    source_start: usize,
     line_number: usize,
 }
 
@@ -407,7 +390,7 @@ struct Header {
 struct ParsedHeaders {
     /// Document title (first h1, if any)
     document_title: Option<String>,
-    /// Outline headers (excludes the first h1)
+    /// All headings shown in the outline
     outline_headers: Vec<Header>,
 }
 
@@ -513,6 +496,12 @@ impl FileTreeNode {
 }
 
 /// File explorer state
+struct ExplorerScanResult {
+    root: PathBuf,
+    sort_order: SortOrder,
+    tree: Vec<FileTreeNode>,
+}
+
 #[derive(Default)]
 struct FileExplorer {
     root: Option<PathBuf>,
@@ -520,7 +509,7 @@ struct FileExplorer {
     expanded_dirs: HashSet<PathBuf>,
     sort_order: SortOrder,
     /// Receiver for asynchronous root-directory scan results.
-    pending_scan: Option<Receiver<Vec<FileTreeNode>>>,
+    pending_scan: Option<Receiver<ExplorerScanResult>>,
 }
 
 impl FileExplorer {
@@ -626,17 +615,24 @@ impl FileExplorer {
         self.root = Some(path.clone());
         if !self.start_root_scan(path.clone(), "explorer-scan") {
             self.tree = Self::scan_directory_shallow(&path, self.sort_order);
+            Self::restore_expanded_children(&mut self.tree, &self.expanded_dirs, self.sort_order);
         }
     }
 
     fn start_root_scan(&mut self, path: PathBuf, thread_name: &str) -> bool {
         let sort_order = self.sort_order;
+        let expanded_dirs = self.expanded_dirs.clone();
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(thread_name.to_owned())
             .spawn(move || {
-                let tree = Self::scan_directory_shallow(&path, sort_order);
-                let _ = tx.send(tree);
+                let mut tree = Self::scan_directory_shallow(&path, sort_order);
+                Self::restore_expanded_children(&mut tree, &expanded_dirs, sort_order);
+                let _ = tx.send(ExplorerScanResult {
+                    root: path,
+                    sort_order,
+                    tree,
+                });
             })
             .is_ok();
         if spawned {
@@ -647,14 +643,31 @@ impl FileExplorer {
 
     /// Check if a background scan completed and apply results
     fn poll_pending_scan(&mut self) -> bool {
-        if let Some(rx) = &self.pending_scan {
-            if let Ok(tree) = rx.try_recv() {
-                self.tree = tree;
+        let received = self.pending_scan.as_ref().map(Receiver::try_recv);
+        let mut result = match received {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
                 self.pending_scan = None;
-                return true;
+                return false;
             }
+        };
+        self.pending_scan = None;
+        // Ignore a stale result if the user selected a different root
+        // while this scan was running.
+        if self.root.as_deref() != Some(result.root.as_path()) {
+            return false;
         }
-        false
+        // A sort change made while the worker was scanning must win.
+        if result.sort_order != self.sort_order {
+            Self::resort_tree_recursive(&mut result.tree, self.sort_order);
+        }
+        // Expansion can change while the worker is running. Existing
+        // snapshot-loaded children are reused; only newly expanded
+        // paths require a shallow scan here.
+        Self::restore_expanded_children(&mut result.tree, &self.expanded_dirs, self.sort_order);
+        self.tree = result.tree;
+        true
     }
 
     /// Refresh the file tree (clears loaded state, rescans shallowly).
@@ -664,11 +677,21 @@ impl FileExplorer {
                 return;
             }
             self.tree = Self::scan_directory_shallow(root, self.sort_order);
-            // Re-load children for currently expanded directories
-            let expanded: Vec<PathBuf> = self.expanded_dirs.iter().cloned().collect();
-            for dir_path in expanded {
-                self.load_children(&dir_path);
-            }
+            Self::restore_expanded_children(&mut self.tree, &self.expanded_dirs, self.sort_order);
+        }
+    }
+
+    fn restore_expanded_children(
+        tree: &mut [FileTreeNode],
+        expanded_dirs: &HashSet<PathBuf>,
+        sort_order: SortOrder,
+    ) {
+        // Parents must be loaded before their expanded descendants can be
+        // found in the lazy tree.
+        let mut expanded: Vec<&PathBuf> = expanded_dirs.iter().collect();
+        expanded.sort_by_key(|path| path.components().count());
+        for path in expanded {
+            Self::load_children_in_tree(tree, path, sort_order);
         }
     }
 
@@ -1090,101 +1113,93 @@ impl Tab {
 
 /// Parse explicit links plus bare local Markdown file references, skipping code blocks.
 fn parse_local_links(content: &str, document_path: &Path) -> Vec<String> {
-    let mut links = Vec::new();
-    let mut in_code_block = false;
+    let mut links = HashSet::new();
     let document_dir = document_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut in_code_block = false;
 
-    // Let the CommonMark parser handle explicit links. A regular expression
-    // cannot correctly cover reference links, nested parentheses, or titles.
+    // Let CommonMark decide which bytes are visible text. Event::Text excludes
+    // fenced/indented code and link destinations, while Event::Code preserves
+    // the viewer extension that makes an inline-code filename clickable.
     for event in pulldown_cmark::Parser::new_ext(content, pulldown_cmark::Options::all()) {
         match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_)) => {
+                in_code_block = true;
+            }
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
+                in_code_block = false;
+            }
             pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. }) => {
                 let destination = dest_url.as_ref();
                 if is_local_markdown_link(destination) || destination.starts_with('#') {
-                    links.push(destination.to_owned());
+                    links.insert(destination.to_owned());
                 }
             }
             pulldown_cmark::Event::Code(code) => {
                 register_existing_markdown_path(&code, document_dir, &mut links);
             }
+            pulldown_cmark::Event::Text(text) if !in_code_block => {
+                register_bare_markdown_paths(&text, document_dir, &mut links);
+            }
             _ => {}
         }
     }
 
-    for line in content.lines() {
-        if line.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-
-        if in_code_block {
-            continue;
-        }
-
-        // Preserve the viewer extension that turns bare Markdown paths into
-        // links. Inline code is included because documentation commonly uses
-        // it for file names; duplicates are removed below.
-        for cap in INLINE_CODE_RE.captures_iter(line) {
-            register_existing_markdown_path(&cap[1], document_dir, &mut links);
-        }
-        for token in line.split_whitespace() {
-            let destination = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '`' | '*'
-                        | '_'
-                        | '"'
-                        | '\''
-                        | '('
-                        | ')'
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | '<'
-                        | '>'
-                        | ','
-                        | '.'
-                        | ';'
-                        | ':'
-                        | '!'
-                        | '?'
-                        | '，'
-                        | '。'
-                        | '；'
-                        | '：'
-                        | '！'
-                        | '？'
-                        | '（'
-                        | '）'
-                        | '【'
-                        | '】'
-                        | '《'
-                        | '》'
-                )
-            });
-            if !is_local_markdown_link(destination) {
-                continue;
-            }
-            register_existing_markdown_path(destination, document_dir, &mut links);
-        }
-    }
-
+    let mut links: Vec<_> = links.into_iter().collect();
     links.sort();
-    links.dedup();
     links
+}
+
+fn register_bare_markdown_paths(text: &str, document_dir: &Path, links: &mut HashSet<String>) {
+    for token in text.split_whitespace() {
+        let destination = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '*'
+                    | '_'
+                    | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | '.'
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '，'
+                    | '。'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+                    | '《'
+                    | '》'
+            )
+        });
+        register_existing_markdown_path(destination, document_dir, links);
+    }
 }
 
 fn register_existing_markdown_path(
     destination: &str,
     document_dir: &Path,
-    links: &mut Vec<String>,
+    links: &mut HashSet<String>,
 ) {
     if !is_local_markdown_link(destination) {
         return;
     }
     if resolve_local_link_path(destination, document_dir).is_some_and(|path| path.is_file()) {
-        links.push(destination.to_owned());
+        links.insert(destination.to_owned());
     }
 }
 
@@ -1240,36 +1255,71 @@ fn resolve_local_link_path(destination: &str, document_dir: &Path) -> Option<Pat
 
 /// Parse markdown headers from content, skipping code blocks.
 fn parse_headers(content: &str) -> ParsedHeaders {
-    let re = &*HEADER_RE;
-    let mut all_headers: Vec<Header> = Vec::new();
-    let mut in_code_block = false;
+    use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
 
-    for (line_number, line) in content.lines().enumerate() {
-        if line.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
+    fn level_number(level: HeadingLevel) -> u8 {
+        match level {
+            HeadingLevel::H1 => 1,
+            HeadingLevel::H2 => 2,
+            HeadingLevel::H3 => 3,
+            HeadingLevel::H4 => 4,
+            HeadingLevel::H5 => 5,
+            HeadingLevel::H6 => 6,
         }
+    }
 
-        if in_code_block {
-            continue;
-        }
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(offset, _)| offset + 1))
+        .collect();
+    let mut all_headers = Vec::new();
+    let mut current: Option<(u8, usize, usize, String)> = None;
 
-        if let Some(caps) = re.captures(line) {
-            let title = caps[2].trim().to_string();
-            let normalized_title = title.to_lowercase();
-            // Count prior headers with the same normalized title so each
-            // duplicate gets a distinct composite cache key.
-            let nth_with_same_text = all_headers
-                .iter()
-                .filter(|h| h.normalized_title == normalized_title)
-                .count();
-            all_headers.push(Header {
-                level: caps[1].len() as u8,
-                title,
-                normalized_title,
-                nth_with_same_text,
-                line_number,
-            });
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(content, pulldown_cmark::Options::all()).into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                let line_number = line_starts
+                    .partition_point(|line_start| *line_start <= range.start)
+                    .saturating_sub(1);
+                current = Some((level_number(level), range.start, line_number, String::new()));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, source_start, line_number, title)) = current.take() {
+                    let title = title.trim().to_owned();
+                    if !title.is_empty() {
+                        all_headers.push(Header {
+                            level,
+                            title,
+                            source_start,
+                            line_number,
+                        });
+                    }
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::FootnoteReference(label) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push('[');
+                    title.push_str(&label);
+                    title.push(']');
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push(' ');
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1758,13 +1808,14 @@ impl MarkdownApp {
             })
             .or_else(|| std::env::current_dir().ok());
 
-        if let Some(ref root) = explorer_root {
-            file_explorer.set_root(root.clone());
-        }
-
-        // Restore expanded directories (children will lazy-load on first render)
+        // Restore expansion before starting the asynchronous scan so its
+        // result already contains the visible expanded subtrees.
         if let Some(expanded) = persisted.expanded_dirs {
             file_explorer.expanded_dirs = expanded.into_iter().collect();
+        }
+
+        if let Some(ref root) = explorer_root {
+            file_explorer.set_root(root.clone());
         }
 
         #[cfg(feature = "mcp")]
@@ -2042,7 +2093,17 @@ impl MarkdownApp {
         }
     }
 
+    /// Start watching because of a user action or configuration change.
+    /// This begins a fresh retry sequence.
     fn start_watching(&mut self) {
+        self.watcher_retry_count = 0;
+        self.start_watching_attempt();
+    }
+
+    /// Perform one watcher construction attempt without resetting the retry
+    /// counter. Recovery paths must use this method so repeated failures can
+    /// actually reach `MAX_WATCHER_RETRIES`.
+    fn start_watching_attempt(&mut self) {
         self.stop_watching();
 
         let tab_paths = self.get_open_tab_paths();
@@ -2177,20 +2238,24 @@ impl MarkdownApp {
             // Bridge thread: forward events and wake egui on demand
             let (bridge_tx, bridge_rx) = mpsc::channel();
             let ctx = self.egui_ctx.clone();
-            std::thread::Builder::new()
+            let bridge = std::thread::Builder::new()
                 .name("watcher-bridge".into())
                 .spawn(move || {
                     while let Ok(event) = debouncer_rx.recv() {
                         let _ = bridge_tx.send(event);
                         ctx.request_repaint();
                     }
-                })
-                .expect("failed to spawn watcher bridge thread");
+                });
+
+            if let Err(error) = bridge {
+                log::error!("Failed to spawn watcher bridge thread: {error}");
+                self.error_message = Some(format!("Failed to start file watcher bridge: {error}"));
+                return;
+            }
 
             self.watcher = Some(fw);
             self.watcher_rx = Some(bridge_rx);
             self.watch_enabled = true;
-            self.watcher_retry_count = 0;
         } else {
             log::error!("Failed to create any file watcher");
             self.error_message = Some("Failed to create file watcher".to_string());
@@ -2301,15 +2366,18 @@ impl MarkdownApp {
             // Attempt recovery if watching is enabled and there's something to watch
             // Check actual tabs and explorer root, not watched_paths (which may be empty after failure)
             let has_watchable = !self.tabs.is_empty() || self.file_explorer.root.is_some();
-            if self.watch_enabled && has_watchable && self.watcher_retry_count < MAX_WATCHER_RETRIES
-            {
-                log::info!(
-                    "Attempting to recover file watcher (attempt {})",
-                    self.watcher_retry_count + 1
-                );
-                self.watcher_retry_count += 1;
-                self.start_watching();
-                self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+            if self.watch_enabled && has_watchable {
+                if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                    self.watcher_retry_count = attempt;
+                    log::info!("Attempting to recover file watcher (attempt {attempt})");
+                    self.start_watching_attempt();
+                    self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+                } else {
+                    self.error_message = Some(format!(
+                        "File watcher failed after {MAX_WATCHER_RETRIES} retries"
+                    ));
+                    self.watch_enabled = false;
+                }
             }
             return Vec::new();
         };
@@ -2332,13 +2400,10 @@ impl MarkdownApp {
                     self.watcher = None;
                     self.watcher_rx = None;
 
-                    if self.watcher_retry_count < MAX_WATCHER_RETRIES {
-                        self.watcher_retry_count += 1;
-                        log::info!(
-                            "Attempting watcher recovery (attempt {})",
-                            self.watcher_retry_count
-                        );
-                        self.start_watching();
+                    if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                        self.watcher_retry_count = attempt;
+                        log::info!("Attempting watcher recovery (attempt {attempt})");
+                        self.start_watching_attempt();
                         self.egui_ctx.request_repaint_after(Duration::from_secs(2));
                     } else {
                         self.error_message = Some(format!(
@@ -2992,11 +3057,9 @@ impl MarkdownApp {
         // Calculate scroll target if header was clicked
         if let Some(idx) = clicked_header_index {
             if let Some(header) = tab.outline_headers.get(idx) {
-                // Composite key disambiguates duplicate-titled headers (e.g. two
-                // `## Installation` sections). Each occurrence has its own
-                // `nth_with_same_text` index assigned at parse time, and the
-                // renderer records positions under the same composite scheme.
-                let key = header_position_key(&header.normalized_title, header.nth_with_same_text);
+                // Source offsets remain unique even when headings share text or
+                // contain emphasis, inline code, links, or emoji shortcodes.
+                let key = header_position_key(header.source_start);
                 // Try to get actual rendered position from cache first.
                 // With virtualization, the cache may hold a stale value from a
                 // partial render — record the key for the post-render
@@ -4002,7 +4065,7 @@ impl eframe::App for MarkdownApp {
             self.reload_changed_tabs(changed_paths);
         }
 
-        // Poll for async GVFS directory scan completion
+        // Poll for asynchronous Explorer scan completion.
         if self.file_explorer.pending_scan.is_some() {
             if self.file_explorer.poll_pending_scan() {
                 log::info!("GVFS directory scan completed");
@@ -5038,20 +5101,22 @@ mod tests {
     }
 
     #[test]
-    fn shortcode_heading_parser_keeps_raw_identity_and_duplicate_index() {
-        let parsed = parse_headers("# Doc\n\n## Pin :pushpin:\n\n## Pin :pushpin:\n");
+    fn heading_parser_keeps_raw_shortcode_display_and_source_identity() {
+        let markdown = "# Doc\n\n## Pin :pushpin:\n\n## Pin :pushpin:\n";
+        let parsed = parse_headers(markdown);
         assert_eq!(parsed.outline_headers.len(), 3);
         assert_eq!(parsed.outline_headers[1].title, "Pin :pushpin:");
-        assert_eq!(parsed.outline_headers[1].normalized_title, "pin :pushpin:");
-        assert_eq!(parsed.outline_headers[1].nth_with_same_text, 0);
-        assert_eq!(parsed.outline_headers[2].normalized_title, "pin :pushpin:");
-        assert_eq!(parsed.outline_headers[2].nth_with_same_text, 1);
         assert_eq!(
-            header_position_key(
-                &parsed.outline_headers[2].normalized_title,
-                parsed.outline_headers[2].nth_with_same_text,
-            ),
-            "pin :pushpin:#1"
+            parsed.outline_headers[1].source_start,
+            markdown.find("## Pin").unwrap()
+        );
+        assert_eq!(
+            parsed.outline_headers[2].source_start,
+            markdown.rfind("## Pin").unwrap()
+        );
+        assert_ne!(
+            header_position_key(parsed.outline_headers[1].source_start),
+            header_position_key(parsed.outline_headers[2].source_start)
         );
     }
 
@@ -5059,9 +5124,24 @@ mod tests {
     fn unknown_shortcode_heading_stays_raw() {
         let parsed = parse_headers("# Doc\n\n## Pin :not_a_gemoji:\n");
         assert_eq!(parsed.outline_headers[1].title, "Pin :not_a_gemoji:");
+    }
+
+    #[test]
+    fn heading_parser_uses_commonmark_for_formatting_links_and_setext() {
+        let markdown = concat!(
+            "# **Bold** and `code` [link](guide.md)\n\n",
+            "Setext *title*\n-----\n\n",
+            "~~~markdown\n# Hidden heading\n~~~\n",
+        );
+        let parsed = parse_headers(markdown);
+        assert_eq!(parsed.outline_headers.len(), 2);
+        assert_eq!(parsed.outline_headers[0].title, "Bold and code link");
+        assert_eq!(parsed.outline_headers[0].level, 1);
+        assert_eq!(parsed.outline_headers[1].title, "Setext title");
+        assert_eq!(parsed.outline_headers[1].level, 2);
         assert_eq!(
-            parsed.outline_headers[1].normalized_title,
-            "pin :not_a_gemoji:"
+            parsed.outline_headers[1].source_start,
+            markdown.find("Setext").unwrap()
         );
     }
 
@@ -5108,6 +5188,29 @@ mod tests {
     fn nonexistent_bare_markdown_path_is_not_registered() {
         let document = std::env::temp_dir().join("md-viewer-auto-link-missing/index.md");
         assert!(parse_local_links("See missing.md for details.", &document).is_empty());
+    }
+
+    #[test]
+    fn fenced_code_never_registers_bare_markdown_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-fenced-link-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("index.md");
+        fs::write(&document, "# Index").unwrap();
+        fs::write(root.join("guide.md"), "# Guide").unwrap();
+
+        let fenced = concat!(
+            "~~~text\nguide.md\n~~~\n\n",
+            "````text\nguide.md\n````\n\n",
+            "    guide.md\n",
+        );
+        assert!(parse_local_links(fenced, &document).is_empty());
+        assert_eq!(parse_local_links("`guide.md`", &document), vec!["guide.md"]);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5176,6 +5279,39 @@ mod tests {
         assert!(nodes.iter().any(|node| {
             matches!(node, FileTreeNode::Directory { name, .. } if name == "linked-docs")
         }));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asynchronous_explorer_refresh_restores_expanded_children() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-explorer-refresh-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let expanded = root.join("docs");
+        fs::create_dir_all(&expanded).unwrap();
+        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
+
+        let mut explorer = FileExplorer {
+            root: Some(root.clone()),
+            expanded_dirs: HashSet::from([expanded.clone()]),
+            ..Default::default()
+        };
+        explorer.refresh();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while explorer.pending_scan.is_some() && Instant::now() < deadline {
+            explorer.poll_pending_scan();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let children = explorer
+            .get_children(&expanded)
+            .expect("expanded directory children restored");
+        assert!(children
+            .iter()
+            .any(|node| matches!(node, FileTreeNode::File { name, .. } if name == "guide.md")));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5273,5 +5409,14 @@ mod tests {
             keyboard_scroll_target(25.0, 500.0, 300.0, KeyboardScrollAction::LineDown),
             0.0
         );
+    }
+
+    #[test]
+    fn watcher_retry_sequence_stops_at_configured_limit() {
+        assert_eq!(next_watcher_retry(0), Some(1));
+        assert_eq!(next_watcher_retry(1), Some(2));
+        assert_eq!(next_watcher_retry(2), Some(3));
+        assert_eq!(next_watcher_retry(3), None);
+        assert_eq!(next_watcher_retry(u32::MAX), None);
     }
 }

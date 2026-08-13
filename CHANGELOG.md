@@ -6,6 +6,10 @@ All notable changes to markdown-viewer will be documented in this file.
 
 ### Fixed
 
+- Preserve expanded Explorer subtrees across asynchronous refreshes, including root and sort changes made while a scan is running.
+- Build Outline entries and scroll targets from the same CommonMark heading events, so formatted, linked, Setext, and duplicate headings navigate correctly.
+- Exclude fenced and indented code blocks from bare Markdown-path auto-linking while retaining explicit and inline-code links.
+- Bound file-watcher recovery attempts correctly and report bridge-thread startup failures without panicking.
 - Keep tabs and back/forward history unchanged when a document cannot be read, and report file-open and reload failures in the existing error bar.
 - Parse explicit local links with CommonMark semantics, including reference links, nested parentheses, titles, and percent-encoded relative paths.
 - Prevent LaTeX-style delimiters from pairing across inline code, HTML, or link destinations while retaining absolute-value bars inside table formulas.
