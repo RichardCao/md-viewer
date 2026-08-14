@@ -6,6 +6,7 @@ All notable changes to markdown-viewer will be documented in this file.
 
 ### Fixed
 
+- Keep viewport-sliced scrolling at the bootstrap document height by positioning the visible event slice in an absolute child UI; deep scrolling no longer creates a phantom blank region.
 - Preserve expanded Explorer subtrees across asynchronous refreshes, including root and sort changes made while a scan is running.
 - Build Outline entries and scroll targets from the same CommonMark heading events, so formatted, linked, Setext, and duplicate headings navigate correctly.
 - Exclude fenced and indented code blocks from bare Markdown-path auto-linking while retaining explicit and inline-code links.

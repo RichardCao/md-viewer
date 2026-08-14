@@ -1066,18 +1066,11 @@ impl CommonMarkViewerInternal {
             // acceptable for a one-off action.
             //
             // Critically, we DO NOT clear split_points here even though
-            // `page_size = None` forces a bootstrap. Reason: split_points
-            // store screen-y coordinates which are only meaningful at the
-            // scroll position they were captured at. The original scroll=0
-            // bootstrap stored values where screen-y ≈ content-y + panel
-            // chrome (~44 px). Clearing here lets the forced bootstrap at
-            // non-zero scroll re-populate them with screen-y values that
-            // diverge from content-y by the scroll amount, breaking every
-            // subsequent skip-paint's partition_point / allocate_space math
-            // by hundreds of pixels (visible as outline-click landing at
-            // the wrong heading and blank space at viewport top after
-            // scrolling). The push-site dedup-by-event-index keeps the
-            // original (good) values intact even though bootstrap re-runs.
+            // `page_size = None` forces a bootstrap. A programmatic jump can
+            // run that bootstrap at a non-zero offset; keeping the positions
+            // measured by the original top-of-document bootstrap avoids
+            // replacing them with a transient coordinate set. The push-site
+            // dedup-by-event-index preserves those original values.
             if pending_scroll_offset.is_some() {
                 sc.page_size = None;
             }
@@ -1151,8 +1144,7 @@ impl CommonMarkViewerInternal {
             let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
 
             let max_width = options.max_width(ui);
-            ui.allocate_ui_with_layout(egui::vec2(max_width, 0.0), layout, |ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
+            let (first_event_index, first_end_y, events_range) = {
                 let scroll_cache = scroll_cache(cache, &source_id);
 
                 // split_points are populated in event order, which matches
@@ -1202,57 +1194,57 @@ impl CommonMarkViewerInternal {
                         Vec::new()
                     };
 
-                // Advance cursor VERTICALLY by first_end_position.y to
-                // position events at the right viewport y. `to_vec2()`
-                // would also pass first_end_position.x as allocation
-                // width — that's the X-cursor where the previous block
-                // ended (often a non-zero left margin or a list-indent
-                // depth). In `left_to_right(BOTTOM).with_main_wrap`,
-                // allocate_space consumes that as width-advance,
-                // shifting subsequent events right and breaking
-                // indentation of code blocks, tables, and text.
-                ui.allocate_space(egui::vec2(0.0, first_end_position.y));
+                (first_event_index, first_end_position.y, events_range)
+            };
 
-                // Re-attach original indices via map so peekable iteration
-                // and downstream consumers still see the absolute event
-                // index (used by `if i == 0 { ... }` below for the
-                // bootstrap-newline gate).
-                let mut events = events_range
-                    .into_iter()
-                    .enumerate()
-                    .map(|(offset, ev)| (offset + first_event_index, ev))
-                    .peekable();
+            // Position the slice with an absolute child rectangle, following
+            // egui's `ScrollArea::show_rows` pattern. Advancing the parent
+            // cursor with `allocate_space(first_end_y)` after `set_height`
+            // made the reported content height grow by roughly the current
+            // scroll offset. That created a phantom lower half where no
+            // events existed, visible as a white document while scrolling.
+            let content_top = ui.max_rect().top();
+            let slice_top = content_top + first_end_y;
+            let slice_bottom = (content_top + page_size.y).max(slice_top);
+            let slice_rect = egui::Rect::from_x_y_ranges(
+                ui.max_rect().left()..=ui.max_rect().left() + max_width,
+                slice_top..=slice_bottom,
+            );
 
-                while let Some((i, (e, src_span))) = events.next() {
-                    if events.peek().is_none() {
-                        self.line.should_end_newline_forced = false;
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(slice_rect).layout(layout),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let height = ui.text_style_height(&TextStyle::Body);
+                    ui.set_row_height(height);
+
+                    // Re-attach original indices via map so peekable iteration
+                    // and downstream consumers still see the absolute event
+                    // index (used by `if i == 0 { ... }` below for the
+                    // bootstrap-newline gate).
+                    let mut events = events_range
+                        .into_iter()
+                        .enumerate()
+                        .map(|(offset, ev)| (offset + first_event_index, ev))
+                        .peekable();
+
+                    while let Some((i, (e, src_span))) = events.next() {
+                        if events.peek().is_none() {
+                            self.line.should_end_newline_forced = false;
+                        }
+
+                        self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
+
+                        if i == 0 {
+                            self.line.should_not_start_newline_forced = false;
+                        }
                     }
-
-                    self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
-
-                    if i == 0 {
-                        self.line.should_not_start_newline_forced = false;
-                    }
-                }
-            });
+                },
+            );
         });
-        // NOTE: deliberately NOT updating last_content_h from skip-paint's
-        // `out.content_size.y`. That value is unreliable: skip-paint does
-        // `set_height(page_size.y)` (min height) then `allocate_space(Vec2(0,
-        // first_end_position.y))` which can advance the cursor by tens of
-        // thousands of px when scrolled deep — content_size.y inflates to
-        // 2× the real document height. Feeding that into the drift check
-        // triggers an invalidation, re-bootstrap fires at the current
-        // (non-zero) scroll, split_points get repopulated with screen-y
-        // coords that are catastrophically off, the next skip-paint picks
-        // wrong events, content_h spikes the other way, drift fires again
-        // — death spiral. Empirically: 619 bootstraps in 30 s of scroll on
-        // T470, panel flickered blank with garbled styling. Restricting
-        // drift signal to bootstrap-only content_h prevents the false
-        // positive. Async-image-load growth is still caught — that fires
-        // during the SECOND bootstrap (which is allowed to happen for
-        // other reasons, e.g. font/scrollbar layout settling at startup),
-        // where the new content_h IS written to last_content_h.
+        // `out.content_size.y` now stays equal to `page_size.y`: the sliced
+        // child is absolutely positioned inside the already-sized content UI
+        // instead of advancing its cursor by the scroll offset.
 
         // Scroll-overshoot clamp.
         let real_max_scroll = (page_size.y - out.inner_rect.height()).max(0.0);
@@ -1263,7 +1255,6 @@ impl CommonMarkViewerInternal {
             state.store(ui.ctx(), out.id);
             ui.ctx().request_repaint();
         }
-        let _ = clamped;
         out
         // No trailing invalidation needed — layout_signature is checked at
         // the top of show_scrollable, so a width/zoom/theme change in the
