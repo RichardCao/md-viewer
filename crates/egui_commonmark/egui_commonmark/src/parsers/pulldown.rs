@@ -554,10 +554,12 @@ fn parse_markdown_events(
         // Both ends must be visible Markdown text. Without this check an
         // opener in prose could pair with a closer in inline code, HTML, or a
         // link destination and rewrite unrelated Markdown structure.
-        let raw_inline_table_closer = inline_open
-            .is_some_and(|open| bytes[at + 1] == b')' && table_closer_is_plain(open, at));
-        let raw_display_table_closer = display_open
-            .is_some_and(|open| bytes[at + 1] == b']' && table_closer_is_plain(open, at));
+        let raw_inline_table_closer = inline_open.is_some_and(|open| {
+            unescaped_slash(at) && bytes[at + 1] == b')' && table_closer_is_plain(open, at)
+        });
+        let raw_display_table_closer = display_open.is_some_and(|open| {
+            unescaped_slash(at) && bytes[at + 1] == b']' && table_closer_is_plain(open, at)
+        });
         if eligible(at) || raw_inline_table_closer || raw_display_table_closer {
             if bytes[at + 1] == b')' && display_open.is_none() {
                 if let Some(open) = inline_open.take() {
@@ -2476,6 +2478,41 @@ mod tests {
             &markdown[display_range.clone()],
             "\\[\n\\boxed{\\operatorname{RMean}_{31}(x)}\n\\]"
         );
+    }
+
+    #[test]
+    fn latex_style_math_preserves_command_at_closing_delimiter() {
+        let markdown = concat!(
+            r"prose \(D_t+\epsilon\)",
+            "\n\n",
+            "| formula |\n|---|\n",
+            r"| \(D_t+\epsilon\) |",
+            "\n",
+            r"| \(P_t=EW_{10s}[a_t/(D_t^{opp}+\epsilon)]-EW_{60s}[a_t/(D_t^{opp}+\epsilon)]\) |",
+            "\n",
+            r"| \[A[x]+B[y]\] |",
+            "\n",
+        );
+        let events = parse_markdown_events(markdown, true);
+        let formulas: Vec<_> = events
+            .iter()
+            .filter_map(|(event, _)| match event {
+                Event::InlineMath(tex) => Some(tex.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            formulas,
+            [
+                r"D_t+\epsilon",
+                r"D_t+\epsilon",
+                r"P_t=EW_{10s}[a_t/(D_t^{opp}+\epsilon)]-EW_{60s}[a_t/(D_t^{opp}+\epsilon)]",
+            ]
+        );
+        assert!(events
+            .iter()
+            .any(|(event, _)| event == &Event::DisplayMath("A[x]+B[y]".into())));
     }
 
     #[test]

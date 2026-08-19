@@ -398,6 +398,21 @@ mod tests {
 
     #[cfg(feature = "math")]
     #[test]
+    fn renders_epsilon_at_end_of_formula() {
+        for latex in [
+            r"\epsilon",
+            r"D_t^{opp}+\epsilon",
+            r"a_t/(D_t^{opp}+\epsilon)",
+            r"P_t=EW_{10s}[a_t/(D_t^{opp}+\epsilon)]-EW_{60s}[a_t/(D_t^{opp}+\epsilon)]",
+            r"C_t=EW_{30s}[OFI_t^1/(D_t^1+\epsilon)-\sum_{k=2}^5w_k OFI_t^k/(\sum_{k=2}^5w_kD_t^k+\epsilon)]",
+        ] {
+            render_math_formula(latex, true, egui::Color32::BLACK, egui::Color32::WHITE)
+                .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
+        }
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
     fn renders_cases_and_boxed_named_operator_formulas() {
         let formulas = [
             r#"r_t=\begin{cases}0, & t=0,\\ \log(m_t)-\log(m_{t-1}), & t>0.\end{cases}"#,
