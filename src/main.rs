@@ -376,9 +376,17 @@ struct PersistedState {
     explorer_root: Option<PathBuf>,
     expanded_dirs: Option<Vec<PathBuf>>,
     explorer_sort_order: Option<SortOrder>,
+    explorer_width: Option<f32>,
+    outline_width: Option<f32>,
     recent_files: Option<Vec<RecentEntry>>,
 }
 
+fn restored_sidebar_width(width: Option<f32>, default: f32) -> f32 {
+    width
+        .filter(|width| width.is_finite())
+        .map(|width| width.max(SIDEBAR_MIN_WIDTH))
+        .unwrap_or(default)
+}
 /// Represents a markdown header for the outline
 #[derive(Clone)]
 struct Header {
@@ -1714,6 +1722,8 @@ struct MarkdownApp {
     // File explorer state
     file_explorer: FileExplorer,
     show_explorer: bool,
+    explorer_width: f32,
+    outline_width: f32,
     // Flash effect for updated files (path -> start time)
     flashing_paths: HashMap<PathBuf, Instant>,
     // True if running on virtual display (e.g., Xvfb :99) - limits frame rate
@@ -1795,6 +1805,9 @@ impl MarkdownApp {
         let show_outline = persisted.show_outline.unwrap_or(true);
         let full_width_content = persisted.full_width_content.unwrap_or(false);
         let show_explorer = persisted.show_explorer.unwrap_or(true);
+        let explorer_width =
+            restored_sidebar_width(persisted.explorer_width, EXPLORER_DEFAULT_WIDTH);
+        let outline_width = restored_sidebar_width(persisted.outline_width, OUTLINE_DEFAULT_WIDTH);
 
         // Determine initial tabs
         let initial_tabs: Vec<Tab> = if let Some(ref path) = file {
@@ -1880,6 +1893,8 @@ impl MarkdownApp {
             hovered_tab: None,
             file_explorer,
             show_explorer,
+            explorer_width,
+            outline_width,
             flashing_paths: HashMap::new(),
             is_virtual_display,
             egui_ctx: cc.egui_ctx.clone(),
@@ -2877,9 +2892,9 @@ impl MarkdownApp {
 
         let is_dragging = ctx.input(|i| i.pointer.any_down());
 
-        egui::SidePanel::right("outline")
+        let panel = egui::SidePanel::right("outline")
             .resizable(true)
-            .default_width(200.0)
+            .default_width(self.outline_width)
             .width_range(SIDEBAR_MIN_WIDTH..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
@@ -3040,6 +3055,7 @@ impl MarkdownApp {
                         }
                     });
             });
+        self.outline_width = panel.response.rect.width();
 
         // Register all collected widgets with MCP bridge
         #[cfg(feature = "mcp")]
@@ -3393,9 +3409,9 @@ impl MarkdownApp {
             return action;
         }
 
-        egui::SidePanel::left("file_explorer")
+        let panel = egui::SidePanel::left("file_explorer")
             .resizable(true)
-            .default_width(200.0)
+            .default_width(self.explorer_width)
             .width_range(SIDEBAR_MIN_WIDTH..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
@@ -3531,6 +3547,7 @@ impl MarkdownApp {
                     self.reconcile_explorer_watches();
                 }
             });
+        self.explorer_width = panel.response.rect.width();
 
         action
     }
@@ -4007,6 +4024,8 @@ impl eframe::App for MarkdownApp {
             explorer_root: self.file_explorer.root.clone(),
             expanded_dirs: Some(self.file_explorer.expanded_dirs.iter().cloned().collect()),
             explorer_sort_order: Some(self.file_explorer.sort_order),
+            explorer_width: Some(self.explorer_width),
+            outline_width: Some(self.outline_width),
             recent_files: Some(self.recent_files.clone()),
         };
         eframe::set_value(storage, APP_KEY, &state);
@@ -5159,6 +5178,14 @@ mod tests {
             .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_sidebar_widths_are_sanitized() {
+        assert_eq!(restored_sidebar_width(Some(320.0), 200.0), 320.0);
+        assert_eq!(restored_sidebar_width(Some(20.0), 200.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(restored_sidebar_width(Some(f32::NAN), 200.0), 200.0);
+        assert_eq!(restored_sidebar_width(Some(f32::INFINITY), 200.0), 200.0);
     }
 
     #[test]
