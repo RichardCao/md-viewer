@@ -2317,6 +2317,8 @@ mod tests {
 
             assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
         });
+    }
+
     #[test]
     fn registered_markdown_paths_are_detected_as_auto_links() {
         let hooks = std::collections::HashMap::from([
