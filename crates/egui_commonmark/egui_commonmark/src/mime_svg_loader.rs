@@ -133,10 +133,7 @@ fn family_is_loaded(database: &Database, requested: &str) -> bool {
 
 #[cfg(feature = "svg_text")]
 fn fontconfig_sans_serif_family() -> Option<String> {
-    #[cfg(all(
-        unix,
-        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
-    ))]
+    #[cfg(all(unix, not(any(target_vendor = "apple", target_os = "android"))))]
     {
         use std::process::{Command, Stdio};
 
@@ -155,7 +152,11 @@ fn fontconfig_sans_serif_family() -> Option<String> {
     None
 }
 
-#[cfg(feature = "svg_text")]
+#[cfg(all(
+    feature = "svg_text",
+    unix,
+    not(any(target_vendor = "apple", target_os = "android"))
+))]
 fn parse_fontconfig_family(stdout: &[u8]) -> Option<String> {
     let family = String::from_utf8_lossy(stdout);
     let family = family.trim();
@@ -262,7 +263,11 @@ mod tests {
         Color32, ColorImage,
     };
 
-    #[cfg(feature = "svg_text")]
+    #[cfg(all(
+        feature = "svg_text",
+        unix,
+        not(any(target_vendor = "apple", target_os = "android"))
+    ))]
     use super::parse_fontconfig_family;
     use super::{is_svg_mime, trim_svg_cache, MimeSvgLoader, SvgCacheEntry};
 
@@ -274,7 +279,11 @@ mod tests {
         assert!(!is_svg_mime("image/png"));
     }
 
-    #[cfg(feature = "svg_text")]
+    #[cfg(all(
+        feature = "svg_text",
+        unix,
+        not(any(target_vendor = "apple", target_os = "android"))
+    ))]
     #[test]
     fn parses_concrete_fontconfig_family() {
         assert_eq!(
