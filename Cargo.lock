@@ -8046,7 +8046,3 @@ dependencies = [
  "syn 3.0.4",
  "winnow 1.0.4",
 ]
-
-[[patch.unused]]
-name = "egui_commonmark_macros_extended"
-version = "0.27.0"
