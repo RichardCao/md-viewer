@@ -317,6 +317,10 @@ fn wrapped_text_height(ui: &Ui, text: &str, column_width: f32, line_height: f32)
     line_height * 1.5 * galley.rows.len().max(1) as f32
 }
 
+fn content_relative_y(screen_y: f32, render_origin_y: f32, slice_start_y: f32) -> f32 {
+    slice_start_y + screen_y - render_origin_y
+}
+
 /// Preserve naturally narrow columns while sharing the remaining width among
 /// wider columns. If even the minimum widths do not fit, horizontal scrolling
 /// remains available.
@@ -470,6 +474,8 @@ pub struct CommonMarkViewerInternal {
     current_heading_text: String,
     /// Accumulate heading RichText fragments for single render at end
     current_heading_rich_texts: Vec<egui::RichText>,
+    /// Content-space Y of the first event rendered by the current slice.
+    slice_start_y: f32,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -498,6 +504,7 @@ impl CommonMarkViewerInternal {
             current_heading_source_start: None,
             current_heading_text: String::new(),
             current_heading_rich_texts: Vec::new(),
+            slice_start_y: 0.0,
         }
     }
 }
@@ -713,6 +720,7 @@ impl CommonMarkViewerInternal {
         text: &str,
         split_points_id: Option<Id>,
     ) -> (egui::InnerResponse<()>, Vec<CheckboxClickEvent>) {
+        self.slice_start_y = 0.0;
         let max_width = options.max_width(ui);
         let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
 
@@ -868,6 +876,7 @@ impl CommonMarkViewerInternal {
         text: &str,
         content_version: Option<u64>,
         pending_scroll_offset: Option<f32>,
+        force_full_render: bool,
         scroll_source: Option<egui::scroll_area::ScrollSource>,
     ) -> egui::scroll_area::ScrollAreaOutput<()> {
         let available_size = ui.available_size();
@@ -927,21 +936,17 @@ impl CommonMarkViewerInternal {
                 sc.page_size = None;
                 sc.split_points.clear();
             }
-            // When the caller wants to jump to a specific scroll position
-            // (outline click, search-jump), we must paint *every* event
-            // this frame — not just the viewport-clipped subset. Otherwise
-            // a far target's block doesn't paint, the cache.active_search_y
-            // / header_position never gets recorded, and the two-stage
-            // corrective scroll (src/main.rs:scroll_to_active_match) can't
-            // snap to the precise y. Forcing the bootstrap branch costs one
-            // full-paint frame (~100 ms at 100k lines) per jump, which is
-            // acceptable for a one-off action.
+            // An unknown navigation target may require painting every event
+            // so its precise position can be measured. Scrolling to an
+            // already cached Y must not take this path: nested virtualized
+            // widgets can report different off-screen heights during a
+            // nonzero-offset full paint and overwrite valid coordinates.
             //
             // Keep the already-valid split points: this bootstrap is needed
             // to paint every event for the jump, not to recompute geometry.
             // The push site deduplicates by event index, so the full render
             // can still refresh page_size without rebuilding the split list.
-            if pending_scroll_offset.is_some() {
+            if force_full_render {
                 sc.page_size = None;
             }
         }
@@ -1062,6 +1067,7 @@ impl CommonMarkViewerInternal {
             ui.scope_builder(
                 egui::UiBuilder::new().max_rect(slice_rect).layout(layout),
                 |ui| {
+                    self.slice_start_y = first_end_y;
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.set_row_height(ui.text_style_height(&TextStyle::Body));
 
@@ -1991,8 +1997,9 @@ impl CommonMarkViewerInternal {
                         // closure's ui top-left, which tracks the current
                         // scroll offset (it shifts up as the user scrolls).
                         // The subtraction cancels out both the panel chrome
-                        // AND any active scroll offset, leaving a pure
-                        // content-y that's invariant across scroll positions.
+                        // and any active scroll offset. A viewport slice starts
+                        // at `slice_start_y` rather than document y=0, so add
+                        // that origin back before updating the shared cache.
                         //
                         // Empirical verification on Recent-Changes.md:
                         // - At scroll=0: title cursor=323, min_rect.top()=44
@@ -2004,7 +2011,11 @@ impl CommonMarkViewerInternal {
                         // Previously stored `cur_offset + cursor.y` which gave
                         // 323 (off by 44 = panel chrome height), so scrolling
                         // to (323-50)=273 landed 44 px past the heading.
-                        let content_y = y - ui.min_rect().top();
+                        let content_y = content_relative_y(
+                            y,
+                            ui.min_rect().top(),
+                            self.slice_start_y,
+                        );
                         // Always refresh with current layout, not first-paint
                         // value. First-paint pinning produced increasing
                         // overshoot for deeper headers — the first frame
@@ -2390,6 +2401,7 @@ mod tests {
                 markdown,
                 Some(1),
                 None,
+                false,
                 None,
             );
             let sc = scroll_cache(&mut cache, &source_id);
@@ -2423,6 +2435,7 @@ mod tests {
                 markdown,
                 Some(1),
                 None,
+                false,
                 None,
             );
         });
@@ -2755,6 +2768,12 @@ mod tests {
             assert!(cache.get_header_position("heading-source:0").is_some());
             assert!(cache.get_header_position("heading-source:20").is_some());
         });
+    }
+
+    #[test]
+    fn sliced_heading_position_includes_the_slice_origin() {
+        assert_eq!(content_relative_y(50.0, -229.0, 0.0), 279.0);
+        assert_eq!(content_relative_y(120.0, 80.0, 1_976.0), 2_016.0);
     }
 
     #[test]

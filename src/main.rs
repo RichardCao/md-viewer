@@ -3133,11 +3133,10 @@ impl MarkdownApp {
                     let estimated_y = (header.line_number as f32 / tab.content_lines as f32)
                         * tab.last_content_height;
                     tab.pending_scroll_offset = Some((estimated_y - 50.0).max(0.0));
+                    // The estimate only gets us near the target. Request one
+                    // complete paint so the corrective pass can measure it.
+                    tab.pending_header_click_key = Some(key);
                 }
-                // Remember the click target — once the bootstrap full paint
-                // triggered by `pending_scroll_offset` populates the cache, the
-                // corrective step in `render_tab_content` snaps to the precise y.
-                tab.pending_header_click_key = Some(key);
             }
         }
     }
@@ -3324,6 +3323,8 @@ impl MarkdownApp {
                 // version through builder methods. The returned ScrollAreaOutput
                 // exposes state.offset and inner_rect for the post-render
                 // selection-preserving wheel hack below.
+                let force_full_render =
+                    tab.pending_header_click_key.is_some() || tab.correct_active_search_pending;
                 let pending = tab.pending_scroll_offset.take();
                 let default_width = content_default_width(self.full_width_content);
                 let mut scroll_output = CommonMarkViewer::new()
@@ -3346,6 +3347,7 @@ impl MarkdownApp {
                     .heading_spacing_below(0.75)
                     .content_version(tab.content_version)
                     .pending_scroll_offset(pending)
+                    .force_full_render(force_full_render)
                     .scroll_source(egui::scroll_area::ScrollSource {
                         scroll_bar: true,
                         drag: false,
