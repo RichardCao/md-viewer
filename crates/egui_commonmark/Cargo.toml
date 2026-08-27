@@ -28,6 +28,7 @@ egui_commonmark_macros_extended = { version = "0.28.0", path = "egui_commonmark_
 document-features = { version = "0.2" }
 
 pulldown-cmark = { version = "0.13", default-features = false }
+unicode-segmentation = "1.12"
 
 
 [patch.crates-io]

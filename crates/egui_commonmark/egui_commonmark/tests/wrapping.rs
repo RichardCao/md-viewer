@@ -10,6 +10,7 @@ use egui_commonmark_extended::{CommonMarkCache, CommonMarkViewer};
 struct PaintedText {
     text: String,
     rect: Rect,
+    rows: usize,
     underlined: bool,
 }
 
@@ -19,6 +20,7 @@ fn collect_painted_text(shape: &Shape, painted: &mut Vec<PaintedText>) {
         Shape::Text(text) => painted.push(PaintedText {
             text: text.galley.job.text.clone(),
             rect: text.galley.rect.translate(text.pos.to_vec2()),
+            rows: text.galley.rows.len(),
             underlined: text
                 .galley
                 .job
@@ -44,7 +46,23 @@ fn render_geometry_with_hooks(
     width: f32,
     hooks: &[&str],
 ) -> (Rect, f32, Vec<PaintedText>) {
+    render_geometry_with_body_size(markdown, width, hooks, None)
+}
+
+fn render_geometry_with_body_size(
+    markdown: &str,
+    width: f32,
+    hooks: &[&str],
+    body_size: Option<f32>,
+) -> (Rect, f32, Vec<PaintedText>) {
     let ctx = Context::default();
+    if let Some(size) = body_size {
+        let mut style = (*ctx.style()).clone();
+        style
+            .text_styles
+            .insert(TextStyle::Body, egui::FontId::proportional(size));
+        ctx.set_style(style);
+    }
     let mut cache = CommonMarkCache::default();
     for hook in hooks {
         cache.add_link_hook(*hook);
@@ -76,6 +94,22 @@ fn render_geometry_with_hooks(
     let body_id = TextStyle::Body.resolve(&ctx.style());
     let row_height = ctx.fonts_mut(|fonts| fonts.row_height(&body_id));
     (body_rect, row_height, painted)
+}
+
+#[test]
+fn fitted_columns_do_not_split_short_header_words() {
+    let markdown = concat!(
+        "| Name | Description | Allowed Types | Required | Games |\n",
+        "|---|---|---|---|---|\n",
+        "| core | For a mission instance with a deliberately long description | Instances | No | DL |",
+    );
+    let (_, _, painted) = render_geometry_with_body_size(markdown, 400.0, &[], Some(16.0));
+    let required = painted
+        .iter()
+        .find(|entry| entry.text == "Required")
+        .unwrap_or_else(|| panic!("missing Required header: {painted:#?}"));
+
+    assert_eq!(required.rows, 1, "short header word was split: {required:?}");
 }
 
 fn render(markdown: &str, width: f32) -> (Rect, f32) {
