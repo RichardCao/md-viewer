@@ -398,6 +398,19 @@ fn content_relative_y(screen_y: f32, render_origin_y: f32, slice_start_y: f32) -
     slice_start_y + screen_y - render_origin_y
 }
 
+fn record_active_search_content_y(
+    cache: &mut CommonMarkCache,
+    screen_y: f32,
+    render_origin_y: f32,
+    slice_start_y: f32,
+) {
+    cache.record_active_search_content_y(content_relative_y(
+        screen_y,
+        render_origin_y,
+        slice_start_y,
+    ));
+}
+
 /// Newline logic is constructed by the following:
 /// All elements try to insert a newline before them (if they are allowed)
 /// and end their own line.
@@ -481,6 +494,10 @@ pub struct CommonMarkViewerInternal {
     current_heading_rich_texts: Vec<egui::RichText>,
     /// Content-space Y of the first event rendered by the current slice.
     slice_start_y: f32,
+    /// Screen-space Y of the root UI for the current full or sliced render.
+    /// Nested table/list/blockquote UIs must not replace this origin when
+    /// converting navigation positions into document coordinates.
+    render_origin_y: f32,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -511,6 +528,7 @@ impl CommonMarkViewerInternal {
             current_heading_text: String::new(),
             current_heading_rich_texts: Vec::new(),
             slice_start_y: 0.0,
+            render_origin_y: 0.0,
         }
     }
 }
@@ -752,6 +770,7 @@ impl CommonMarkViewerInternal {
             ui.set_row_height(height);
             let content_origin_y = ui.next_widget_position().y;
             let content_origin_x = ui.max_rect().left();
+            self.render_origin_y = content_origin_y;
 
             // Use cached events — clone the Vec reference data for iteration
             // (events are 'static so this is cheap pointer copies, not re-parsing)
@@ -1075,6 +1094,7 @@ impl CommonMarkViewerInternal {
                 egui::UiBuilder::new().max_rect(slice_rect).layout(layout),
                 |ui| {
                     self.slice_start_y = first_end_y;
+                    self.render_origin_y = ui.min_rect().top();
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.set_row_height(ui.text_style_height(&TextStyle::Body));
 
@@ -1722,7 +1742,7 @@ impl CommonMarkViewerInternal {
             },
         );
         if let Some(y) = active_y {
-            cache.record_active_search_y_viewport(y);
+            record_active_search_content_y(cache, y, self.render_origin_y, self.slice_start_y);
         }
     }
 
@@ -1837,7 +1857,7 @@ impl CommonMarkViewerInternal {
             );
         });
         if let Some(y) = active_y {
-            cache.record_active_search_y_viewport(y);
+            record_active_search_content_y(cache, y, self.render_origin_y, self.slice_start_y);
         }
     }
 
@@ -2015,20 +2035,19 @@ impl CommonMarkViewerInternal {
                         // SCREEN-y coordinate. The click handler uses the
                         // cached value with `ScrollArea::vertical_scroll_offset(N)`,
                         // which interprets N as a CONTENT-y (where 0 is the
-                        // top of the ScrollArea's content layout). Subtract
-                        // `ui.min_rect().top()` — that's the screen y of the
-                        // closure's ui top-left, which tracks the current
-                        // scroll offset (it shifts up as the user scrolls).
-                        // The subtraction cancels out both the panel chrome
-                        // and any active scroll offset. A viewport slice starts
-                        // at `slice_start_y` rather than document y=0, so add
-                        // that origin back before updating the shared cache.
+                        // top of the ScrollArea's content layout). Subtract the
+                        // root render origin, which tracks the current scroll
+                        // offset but stays stable across nested table, list,
+                        // and blockquote UIs. This cancels out both the panel
+                        // chrome and any active scroll offset. A viewport slice
+                        // starts at `slice_start_y` rather than document y=0,
+                        // so add that origin back before updating the cache.
                         //
                         // Empirical verification on Recent-Changes.md:
-                        // - At scroll=0: title cursor=323, min_rect.top()=44
+                        // - At scroll=0: title cursor=323, render origin=44
                         //   → content_y = 279
                         // - After click to scroll=273: cursor=50,
-                        //   min_rect.top()=-229 → content_y = 279
+                        //   render origin=-229 → content_y = 279
                         // - Same heading, same content_y, regardless of scroll
                         //
                         // Previously stored `cur_offset + cursor.y` which gave
@@ -2036,7 +2055,7 @@ impl CommonMarkViewerInternal {
                         // to (323-50)=273 landed 44 px past the heading.
                         let content_y = content_relative_y(
                             y,
-                            ui.min_rect().top(),
+                            self.render_origin_y,
                             self.slice_start_y,
                         );
                         // Always refresh with current layout, not first-paint
@@ -2797,6 +2816,72 @@ mod tests {
     fn sliced_heading_position_includes_the_slice_origin() {
         assert_eq!(content_relative_y(50.0, -229.0, 0.0), 279.0);
         assert_eq!(content_relative_y(120.0, 80.0, 1_976.0), 2_016.0);
+    }
+
+    #[test]
+    fn sliced_search_position_includes_origin_and_excludes_chrome() {
+        let mut cache = CommonMarkCache::default();
+
+        record_active_search_content_y(&mut cache, 120.0, 80.0, 1_976.0);
+
+        assert_eq!(cache.active_search_y(), Some(2_016.0));
+    }
+
+    #[test]
+    fn nested_navigation_positions_keep_the_root_render_origin() {
+        let markdown = concat!(
+            "Paragraph one.\n\n",
+            "Paragraph two.\n\n",
+            "Paragraph three.\n\n",
+            "Paragraph four.\n\n",
+            "> ## Nested heading\n",
+            "> quoted text\n\n",
+            "| Key | Value |\n",
+            "|---|---|\n",
+            "| row | ACTIVE_TABLE_MATCH |\n",
+        );
+        let active_start = markdown.find("ACTIVE_TABLE_MATCH").unwrap();
+        let active_range = active_start..active_start + "ACTIVE_TABLE_MATCH".len();
+        let heading_source_start = crate::parsers::latex_delimiters::parse_events(markdown, false)
+            .into_iter()
+            .find_map(|(event, range)| {
+                matches!(event, Event::Start(Tag::Heading { .. })).then_some(range.start)
+            })
+            .expect("fixture contains a nested heading");
+        let heading_key = crate::header_position_key(heading_source_start);
+        let mut cache = CommonMarkCache::default();
+        cache.set_search_ranges(vec![active_range.clone()]);
+        cache.set_active_search_range(Some(active_range));
+        let ctx = egui::Context::default();
+        let mut minimum_nested_y = 0.0;
+
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            ui.set_width(400.0);
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+            minimum_nested_y = line_height * 4.0;
+            CommonMarkViewerInternal::new().show(
+                ui,
+                &mut cache,
+                &CommonMarkOptions::default(),
+                markdown,
+                None,
+            );
+        });
+        let _ = ctx.end_pass();
+
+        assert!(
+            cache
+                .get_header_position(&heading_key)
+                .is_some_and(|y| y > minimum_nested_y),
+            "nested heading lost the preceding document height"
+        );
+        assert!(
+            cache
+                .active_search_y()
+                .is_some_and(|y| y > minimum_nested_y),
+            "table-cell search match lost the preceding document height"
+        );
     }
 
     #[test]
