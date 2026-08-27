@@ -97,6 +97,12 @@ fn content_default_width(full_width_content: bool) -> Option<usize> {
     }
 }
 
+fn content_width_limit(full_width_content: bool, available_width: f32) -> usize {
+    let available_width = available_width.max(0.0) as usize;
+    content_default_width(full_width_content)
+        .map_or(available_width, |preferred| preferred.min(available_width))
+}
+
 /// Check whether the desktop portal exposes the interface used by rfd's
 /// Linux folder picker. Calling rfd without this interface fails like a user
 /// cancellation, so checking first lets us distinguish that case and use a
@@ -3326,14 +3332,17 @@ impl MarkdownApp {
                 // selection-preserving wheel hack below.
                 let pending = tab.pending_scroll_offset.take();
                 let default_width = content_default_width(self.full_width_content);
+                let content_width =
+                    content_width_limit(self.full_width_content, content_rect.width());
                 let mut scroll_output = CommonMarkViewer::new()
                     .default_implicit_uri_scheme(&tab.base_uri)
                     .max_image_width(Some(800))
                     .default_width(default_width)
-                    // Tables are not bound by the reading column (#64): a wide
-                    // table spans the whole content pane and scrolls there,
-                    // while prose keeps the reading width.
-                    .table_max_width(Some(content_rect.width() as usize))
+                    // Full Width governs the complete document layout. With
+                    // the reading cap active, tables reflow within it; their
+                    // horizontal scroller still handles minimum-width or
+                    // user-resized overflow (#110).
+                    .table_max_width(Some(content_width))
                     .indentation_spaces(2)
                     .use_strong_font_family(true)
                     .show_alt_text_on_hover(true)
@@ -5035,6 +5044,17 @@ mod tests {
     #[test]
     fn full_width_content_uses_available_width() {
         assert_eq!(content_default_width(true), None);
+    }
+
+    #[test]
+    fn capped_content_applies_the_same_limit_to_tables() {
+        assert_eq!(content_width_limit(false, 900.0), 600);
+        assert_eq!(content_width_limit(false, 480.0), 480);
+    }
+
+    #[test]
+    fn full_width_tables_use_the_available_content_width() {
+        assert_eq!(content_width_limit(true, 900.0), 900);
     }
 
     #[cfg(target_os = "linux")]
