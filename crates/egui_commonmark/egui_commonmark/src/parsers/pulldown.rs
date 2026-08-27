@@ -744,6 +744,7 @@ impl CommonMarkViewerInternal {
             let events_data = cache.get_cached_events(content_hash)
                 .expect("events just cached")
                 .to_vec();
+            let event_count = events_data.len();
             let mut events = events_data
                 .into_iter()
                 .enumerate()
@@ -762,6 +763,14 @@ impl CommonMarkViewerInternal {
                     &e,
                     pulldown_cmark::Event::End(end) if is_block_end_tag(end)
                 );
+                // `table()` consumes the complete table, including its End
+                // event, from `events`. The outer loop therefore never sees
+                // TagEnd::Table and must record that block boundary from its
+                // Start event after processing finishes.
+                let is_atomic_table = matches!(
+                    &e,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))
+                );
 
                 if events.peek().is_none() {
                     self.line.should_end_newline_forced = false;
@@ -770,8 +779,9 @@ impl CommonMarkViewerInternal {
                 self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
 
                 // Defense in depth: only add a split point when we're at a
-                // block end AND outside any stateful container (list, table,
-                // blockquote). The viewport-skip path in `show_scrollable`
+                // block end (or just consumed an atomic table) AND outside any
+                // stateful container (list, table, blockquote). The
+                // viewport-skip path in `show_scrollable`
                 // recreates the renderer with `CommonMarkViewerInternal::new`
                 // each frame, so the transient state of `self.list`,
                 // `self.is_table`, and `self.is_blockquote` is *not* replayed
@@ -784,7 +794,7 @@ impl CommonMarkViewerInternal {
                 // check below must run after `process_event` (above) since
                 // that's where the start/end of these containers updates
                 // `self.list` / `self.is_table` / `self.is_blockquote`.
-                let safe_for_split = is_block_end
+                let safe_for_split = (is_block_end || is_atomic_table)
                     && !self.list.is_inside_a_list()
                     && !self.is_table
                     && !self.is_blockquote;
@@ -794,7 +804,14 @@ impl CommonMarkViewerInternal {
                         let scroll_cache = scroll_cache(cache, &source_id);
                         let end_position = ui.next_widget_position();
 
-                        let split_index = index.saturating_add(1);
+                        let split_index = if is_atomic_table {
+                            events
+                                .peek()
+                                .map(|(next_index, _)| *next_index)
+                                .unwrap_or(event_count)
+                        } else {
+                            index.saturating_add(1)
+                        };
                         let split_point_exists = scroll_cache
                             .split_points
                             .iter()
@@ -995,13 +1012,15 @@ impl CommonMarkViewerInternal {
             let (first_event_index, first_end_y, events_range) = {
                 let scroll_cache = scroll_cache(cache, &source_id);
 
-                // Keep one complete block of safety margin on both sides of
-                // the viewport, and only resume after a complete block.
+                // Resume after the last complete block above the viewport.
+                // Re-rendering an additional fully off-screen table here is
+                // unsafe: egui_extras virtualizes all of its heterogeneous
+                // rows and can report a collapsed height for that table.
                 let above = scroll_cache
                     .split_points
                     .partition_point(|(_, _, end)| end.y < viewport.min.y);
-                let (first_event_index, _, first_end_position) = if above >= 2 {
-                    scroll_cache.split_points[above - 2]
+                let (first_event_index, _, first_end_position) = if above >= 1 {
+                    scroll_cache.split_points[above - 1]
                 } else {
                     (0, Pos2::ZERO, Pos2::ZERO)
                 };
@@ -2384,6 +2403,17 @@ mod tests {
                     );
                 }
             }
+            let table_end_index = sc
+                .events
+                .iter()
+                .position(|(event, _)| matches!(event, Event::End(pulldown_cmark::TagEnd::Table)))
+                .expect("fixture contains a table end");
+            assert!(
+                sc.split_points
+                    .iter()
+                    .any(|(index, _, _)| *index == table_end_index + 1),
+                "atomic table must leave a safe resume point after its consumed End event"
+            );
 
             CommonMarkViewerInternal::new().show_scrollable(
                 source_id,
