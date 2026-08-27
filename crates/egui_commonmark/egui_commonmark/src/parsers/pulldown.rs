@@ -317,10 +317,6 @@ fn wrapped_text_height(ui: &Ui, text: &str, column_width: f32, line_height: f32)
     line_height * 1.5 * galley.rows.len().max(1) as f32
 }
 
-fn content_relative_y(screen_y: f32, render_origin_y: f32, slice_start_y: f32) -> f32 {
-    slice_start_y + screen_y - render_origin_y
-}
-
 /// Preserve naturally narrow columns while sharing the remaining width among
 /// wider columns. If even the minimum widths do not fit, horizontal scrolling
 /// remains available.
@@ -394,6 +390,14 @@ fn forward_shift_wheel_to_horizontal_scroll<R>(
     }
 }
 
+fn markdown_table_id(source_id: Id, source_start: usize) -> Id {
+    source_id.with("_markdown_table").with(source_start)
+}
+
+fn content_relative_y(screen_y: f32, render_origin_y: f32, slice_start_y: f32) -> f32 {
+    slice_start_y + screen_y - render_origin_y
+}
+
 /// Newline logic is constructed by the following:
 /// All elements try to insert a newline before them (if they are allowed)
 /// and end their own line.
@@ -453,6 +457,7 @@ struct DefinitionList {
 pub struct CommonMarkViewerInternal {
     curr_table: usize,
     curr_code_block: usize,
+    source_id: Option<Id>,
     text_style: Style,
     list: List,
     link: Option<Link>,
@@ -488,6 +493,7 @@ impl CommonMarkViewerInternal {
         Self {
             curr_table: 0,
             curr_code_block: 0,
+            source_id: None,
             text_style: Style::default(),
             list: List::default(),
             link: None,
@@ -879,6 +885,7 @@ impl CommonMarkViewerInternal {
         force_full_render: bool,
         scroll_source: Option<egui::scroll_area::ScrollSource>,
     ) -> egui::scroll_area::ScrollAreaOutput<()> {
+        self.source_id = Some(source_id);
         let available_size = ui.available_size();
         let scroll_id = source_id.with("_scroll_area");
         let layout_sig = compute_layout_signature(ui, options);
@@ -1135,11 +1142,23 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
         max_width: f32,
     ) {
+        let table_source_start = matches!(
+            &event,
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))
+        )
+        .then_some(src_span.start);
         self.event(ui, event, src_span, cache, options, max_width);
 
         self.def_list_def_wrapping(events, max_width, cache, options, ui);
         self.item_list_wrapping(events, max_width, cache, options, ui);
-        self.table(events, cache, options, ui, max_width);
+        self.table(
+            events,
+            cache,
+            options,
+            ui,
+            max_width,
+            table_source_start,
+        );
         self.blockquote(events, max_width, cache, options, ui);
     }
 
@@ -1286,11 +1305,15 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
         ui: &mut Ui,
         max_width: f32,
+        source_start: Option<usize>,
     ) {
         if self.is_table {
             self.line.try_insert_start(ui);
 
-            let id = ui.id().with("_table").with(self.curr_table);
+            let id = markdown_table_id(
+                self.source_id.unwrap_or_else(|| ui.id()),
+                source_start.unwrap_or(self.curr_table),
+            );
             self.curr_table += 1;
 
             // Consume events into header/rows up front so we know the column count
@@ -2774,6 +2797,24 @@ mod tests {
     fn sliced_heading_position_includes_the_slice_origin() {
         assert_eq!(content_relative_y(50.0, -229.0, 0.0), 279.0);
         assert_eq!(content_relative_y(120.0, 80.0, 1_976.0), 2_016.0);
+    }
+
+    #[test]
+    fn markdown_table_identity_uses_document_and_source_position() {
+        let document = Id::new("document-a");
+
+        assert_eq!(
+            markdown_table_id(document, 120),
+            markdown_table_id(document, 120)
+        );
+        assert_ne!(
+            markdown_table_id(document, 120),
+            markdown_table_id(document, 240)
+        );
+        assert_ne!(
+            markdown_table_id(document, 120),
+            markdown_table_id(Id::new("document-b"), 120)
+        );
     }
 
     #[test]
