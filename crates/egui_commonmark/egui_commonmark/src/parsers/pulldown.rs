@@ -346,6 +346,22 @@ fn fit_column_widths(desired: &[f32], available: f32, minimum: f32) -> Vec<f32> 
     desired.into_iter().map(|width| width.min(low)).collect()
 }
 
+/// Remember the width contract used to initialize a resizable table.
+///
+/// `egui_extras::TableBuilder` deliberately keeps user-resized column widths,
+/// which also means later `Column::initial` values are ignored. Invalidate that
+/// cached state only when the table's layout bound changes; while the bound is
+/// stable, manual column resizing remains intact.
+fn table_layout_bound_changed(ui: &Ui, table_id: Id, table_bound: f32) -> bool {
+    let state_id = table_id.with("_layout_bound");
+    let current = table_bound.max(0.0).round() as usize;
+    ui.data_mut(|data| {
+        let previous = data.get_temp::<usize>(state_id);
+        data.insert_temp(state_id, current);
+        previous.is_some_and(|previous| previous != current)
+    })
+}
+
 /// Redirect Shift+vertical-wheel over a hovered wide-table into its inner
 /// horizontal scroll offset. Plain vertical wheel is left untouched so the
 /// outer document scroller keeps scrolling the page (this is the behavior
@@ -1301,10 +1317,9 @@ impl CommonMarkViewerInternal {
             // flow Ui from the markdown renderer. Without the vertical scope the
             // body's first row overlaps the header row.
             //
-            // The bound is `table_max_width` rather than the prose `max_width` so a
-            // wide table spreads over the whole content pane even in reading mode,
-            // instead of being clipped at the reading column with its right side
-            // unreachable (#64).
+            // The caller chooses whether `table_max_width` is the capped reading
+            // width or the full content pane. Horizontal scrolling keeps columns
+            // reachable when their minimum widths exceed that bound (#64, #110).
             let table_bound = options
                 .table_max_width
                 .map(|w| w as f32)
@@ -1345,6 +1360,8 @@ impl CommonMarkViewerInternal {
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    let reset_column_widths =
+                                        table_layout_bound_changed(ui, id, table_bound);
                                     let mut builder = egui_extras::TableBuilder::new(ui)
                                         .id_salt(id.with("_wrapped"))
                                         .striped(true)
@@ -1366,6 +1383,9 @@ impl CommonMarkViewerInternal {
                                                 .clip(true)
                                                 .at_least(40.0),
                                         );
+                                    }
+                                    if reset_column_widths {
+                                        builder.reset();
                                     }
                                     builder.body(|mut body| {
                                         let widths = body.widths().to_vec();
@@ -2176,6 +2196,8 @@ impl CommonMarkViewerInternal {
                     .show(ui, |ui| {
                 ui.vertical(|ui| {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
+                        let reset_column_widths =
+                            table_layout_bound_changed(ui, id, table_bound);
                         let mut builder = egui_extras::TableBuilder::new(ui)
                             .id_salt(id.with("_wrapped"))
                             .striped(true)
@@ -2193,6 +2215,10 @@ impl CommonMarkViewerInternal {
                                     .clip(true)
                                     .at_least(40.0),
                             );
+                        }
+
+                        if reset_column_widths {
+                            builder.reset();
                         }
 
                         let render_cell_strong = |ui: &mut Ui, cell: &str| {
@@ -2327,6 +2353,58 @@ mod tests {
                 table_cell_height(&cell, line_height, &cache, ui, 120.0) >= line_height * 2.0
             );
         });
+    }
+
+    fn render_resizable_table_widths(
+        ctx: &egui::Context,
+        table_id: Id,
+        table_bound: f32,
+        initial_widths: &[f32],
+    ) -> Vec<f32> {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 240.0),
+            )),
+            ..Default::default()
+        });
+        let mut rendered_widths = Vec::new();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.set_width(table_bound);
+            ui.set_max_width(table_bound);
+            let reset_column_widths = table_layout_bound_changed(ui, table_id, table_bound);
+            let mut builder = egui_extras::TableBuilder::new(ui)
+                .id_salt(table_id.with("_wrapped"))
+                .resizable(true);
+            for width in initial_widths {
+                builder = builder.column(
+                    egui_extras::Column::initial(*width)
+                        .resizable(true)
+                        .at_least(40.0),
+                );
+            }
+            if reset_column_widths {
+                builder.reset();
+            }
+            builder.body(|body| rendered_widths = body.widths().to_vec());
+        });
+        let _ = ctx.end_pass();
+        rendered_widths
+    }
+
+    #[test]
+    fn resizable_table_state_reflows_when_its_bound_changes() {
+        let ctx = egui::Context::default();
+        let table_id = Id::new("responsive-table");
+        let initial = render_resizable_table_widths(&ctx, table_id, 180.0, &[60.0, 80.0]);
+        let same_bound = render_resizable_table_widths(&ctx, table_id, 180.0, &[90.0, 110.0]);
+        assert_eq!(same_bound, initial, "stable bounds must retain cached widths");
+
+        let wider = render_resizable_table_widths(&ctx, table_id, 360.0, &[120.0, 160.0]);
+        assert!(wider[0] > initial[0] && wider[1] > initial[1]);
+
+        let narrower = render_resizable_table_widths(&ctx, table_id, 140.0, &[40.0, 60.0]);
+        assert!(narrower[0] < wider[0] && narrower[1] < wider[1]);
     }
 
     #[test]

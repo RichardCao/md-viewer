@@ -176,6 +176,63 @@ fn long_html_table_text_wraps_and_expands_its_row() {
     assert!(cell.bottom() <= after.top(), "wrapped row clipped/overlapped: {cell:?} {after:?}");
 }
 
+fn table_cell_height_after_widths(markdown: &str, widths: &[f32], marker: &str) -> Vec<f32> {
+    let ctx = Context::default();
+    let mut cache = CommonMarkCache::default();
+    let mut heights = Vec::new();
+
+    for &width in widths {
+        // Render twice at each width so the assertion observes settled egui
+        // table state rather than the frame that invalidated it.
+        for pass in 0..2 {
+            ctx.begin_pass(Default::default());
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                ui.set_width(width);
+                CommonMarkViewer::new()
+                    .default_width(Some(width as usize))
+                    .table_max_width(Some(width as usize))
+                    .show(ui, &mut cache, markdown);
+            });
+            let output = ctx.end_pass();
+            if pass == 1 {
+                let mut painted = Vec::new();
+                for clipped in output.shapes {
+                    collect_painted_text(&clipped.shape, &mut painted);
+                }
+                heights.push(text_rect(&painted, marker).height());
+            }
+        }
+    }
+    heights
+}
+
+#[test]
+fn markdown_table_reflows_after_panel_width_changes() {
+    let prose = "MARKDOWN_REFLOW_CELL ".repeat(16);
+    let markdown = format!("| Key | Description |\n|---|---|\n| signal | {prose} |");
+    let heights = table_cell_height_after_widths(
+        &markdown,
+        &[220.0, 560.0, 180.0],
+        "MARKDOWN_REFLOW_CELL",
+    );
+
+    assert!(heights[1] < heights[0], "table did not widen: {heights:?}");
+    assert!(heights[2] > heights[1], "table did not narrow: {heights:?}");
+}
+
+#[test]
+fn html_table_reflows_after_panel_width_changes() {
+    let prose = "HTML_REFLOW_CELL ".repeat(16);
+    let markdown = format!(
+        "<table><tr><th>Key</th><th>Description</th></tr><tr><td>signal</td><td>{prose}</td></tr></table>"
+    );
+    let heights =
+        table_cell_height_after_widths(&markdown, &[220.0, 560.0, 180.0], "HTML_REFLOW_CELL");
+
+    assert!(heights[1] < heights[0], "table did not widen: {heights:?}");
+    assert!(heights[2] > heights[1], "table did not narrow: {heights:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Nested-list regression coverage (devlog/027).
 //
