@@ -346,6 +346,21 @@ fn fit_column_widths(desired: &[f32], available: f32, minimum: f32) -> Vec<f32> 
     desired.into_iter().map(|width| width.min(low)).collect()
 }
 
+/// Fit columns inside the table's outer width contract.
+///
+/// The group frame contributes padding and a stroke on both sides. Those are
+/// part of the table's visible width, so only the remaining space belongs to
+/// columns and their separators.
+fn framed_table_widths(ui: &Ui, desired: &[f32], table_bound: f32) -> (egui::Frame, Vec<f32>) {
+    let frame = egui::Frame::group(ui.style());
+    let column_space =
+        ui.spacing().item_spacing.x * desired.len().saturating_sub(1) as f32;
+    let frame_width = frame.total_margin().sum().x;
+    let column_budget = (table_bound - frame_width - column_space).max(0.0);
+    let widths = fit_column_widths(desired, column_budget, 40.0);
+    (frame, widths)
+}
+
 /// Remember the width contract used to initialize a resizable table.
 ///
 /// `egui_extras::TableBuilder` deliberately keeps user-resized column widths,
@@ -1338,9 +1353,8 @@ impl CommonMarkViewerInternal {
                         .fold(40.0, f32::max)
                 })
                 .collect();
-            let column_space = ui.spacing().item_spacing.x * num_cols.saturating_sub(1) as f32;
-            let initial_widths =
-                fit_column_widths(&desired_widths, (table_bound - column_space).max(0.0), 40.0);
+            let (table_frame, initial_widths) =
+                framed_table_widths(ui, &desired_widths, table_bound);
             // The document ui is allocated at the prose width, and a child ui
             // can never exceed its parent's allocation — so a wider viewport
             // must be carved out explicitly. egui does not clamp an explicit
@@ -1359,7 +1373,7 @@ impl CommonMarkViewerInternal {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                table_frame.show(ui, |ui| {
                                     let reset_column_widths =
                                         table_layout_bound_changed(ui, id, table_bound);
                                     let mut builder = egui_extras::TableBuilder::new(ui)
@@ -2179,9 +2193,8 @@ impl CommonMarkViewerInternal {
                     .fold(40.0, f32::max)
             })
             .collect();
-        let column_space = ui.spacing().item_spacing.x * num_cols.saturating_sub(1) as f32;
-        let initial_widths =
-            fit_column_widths(&desired_widths, (table_bound - column_space).max(0.0), 40.0);
+        let (table_frame, initial_widths) =
+            framed_table_widths(ui, &desired_widths, table_bound);
         // Same reading-column escape as markdown tables (#64): carve out a
         // scope wider than the prose allocation, anchored at the cursor.
         let mut table_scope_rect = ui.cursor();
@@ -2195,7 +2208,7 @@ impl CommonMarkViewerInternal {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                 ui.vertical(|ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                    table_frame.show(ui, |ui| {
                         let reset_column_widths =
                             table_layout_bound_changed(ui, id, table_bound);
                         let mut builder = egui_extras::TableBuilder::new(ui)
@@ -2352,6 +2365,21 @@ mod tests {
             assert!(
                 table_cell_height(&cell, line_height, &cache, ui, 120.0) >= line_height * 2.0
             );
+        });
+    }
+
+    #[test]
+    fn fitted_columns_leave_room_for_the_visible_table_frame() {
+        egui::__run_test_ui(|ui| {
+            let table_bound = 360.0;
+            let desired = [400.0, 500.0, 600.0];
+            let (frame, widths) = framed_table_widths(ui, &desired, table_bound);
+            let column_space =
+                ui.spacing().item_spacing.x * desired.len().saturating_sub(1) as f32;
+            let visible_width =
+                widths.iter().sum::<f32>() + column_space + frame.total_margin().sum().x;
+
+            assert!((visible_width - table_bound).abs() < 0.01);
         });
     }
 
