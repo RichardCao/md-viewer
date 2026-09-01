@@ -268,6 +268,14 @@ egui::Frame::none()
 **Why both?** Reduced grab radius alone isn't enough. The 3px margin provides physical separation without creating a visible gap (8px was too much and created a black gap).
 **Files:** `src/main.rs`
 
+### A popup nested directly inside `ui.menu_button(...)` gets swallowed
+**Context:** Issue — highlight-color feature initially put a `ui.color_edit_button_srgba` + reset button inline in the `View` menu (mirroring the file explorer's inline "Sort:" combo box).
+**Problem:** Clicking the color swatch closed the *entire* View menu instead of opening the color picker popup — no crash, no log output, the popup never appeared for even one frame. `menu_button` treats a click it doesn't recognize as "inside an already-registered child popup" as a click *outside* the menu and closes it; a freshly-opened popup (color picker, combo box, anything that creates its own `Area`) isn't part of the menu's popup-tracking until *after* the click that would open it, so the very click meant to open it instead dismisses the parent menu first.
+**Fix:** Don't nest an interactive popup inside a menu. Give it its own `egui::Window` instead, opened via a one-shot menu button (`self.show_x_dialog = true; ui.close();`) — the same architecture the font-selection feature already used for its own searchable picker.
+**Why the file explorer's "Sort:" combo box is fine:** it's not inside a menu popup at all — it's a plain sidebar `Ui`, so there's no parent-menu auto-dismiss logic to conflict with.
+**General rule:** anything beyond a one-shot toggle/button — combo boxes, color pickers, sliders with a popup — does not belong inside `ui.menu_button(...)`'s closure in this codebase. Verify new menu items interactively (e.g. via Xvfb screenshots); this failure produces no error output of any kind, so it is invisible to `cargo build`/`clippy`/`test`.
+**Files:** `src/main.rs` (`render_highlight_color_settings`), `docs/devlog/056-highlight-color-selection.md`
+
 ---
 
 ## Custom Tab System

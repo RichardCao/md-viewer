@@ -369,6 +369,10 @@ struct PersistedState {
     zoom_level: Option<f32>,
     show_outline: Option<bool>,
     full_width_content: Option<bool>,
+    /// Selection/highlight background color override, stored as premultiplied
+    /// RGBA bytes (`Color32`'s canonical representation — see `Color32::r/g/b/a`
+    /// and `Color32::from_rgba_premultiplied`). `None` = current theme default.
+    highlight_color: Option<[u8; 4]>,
     open_tabs: Option<Vec<PathBuf>>,
     active_tab: Option<usize>,
     // File explorer state
@@ -1741,6 +1745,11 @@ struct MarkdownApp {
     zoom_level: f32,
     show_outline: bool,
     full_width_content: bool,
+    // Selection/highlight background color override. `None` = theme default.
+    highlight_color: Option<egui::Color32>,
+    // Mirrors `last_applied_dark_mode`: only rebuild Visuals when this changes.
+    last_applied_highlight_color: Option<egui::Color32>,
+    show_highlight_color_dialog: bool,
     watch_enabled: bool,
     error_message: Option<String>,
     is_dragging: bool,
@@ -1842,6 +1851,9 @@ impl MarkdownApp {
         let zoom_level = persisted.zoom_level.unwrap_or(1.0).clamp(0.5, 3.0);
         let show_outline = persisted.show_outline.unwrap_or(true);
         let full_width_content = persisted.full_width_content.unwrap_or(false);
+        let highlight_color = persisted
+            .highlight_color
+            .map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(r, g, b, a));
         let show_explorer = persisted.show_explorer.unwrap_or(true);
         let explorer_width =
             restored_sidebar_width(persisted.explorer_width, EXPLORER_DEFAULT_WIDTH);
@@ -1933,6 +1945,12 @@ impl MarkdownApp {
             zoom_level,
             show_outline,
             full_width_content,
+            // Frame 1 always rebuilds Visuals anyway (last_applied_dark_mode
+            // starts at None), so this just avoids a spurious second rebuild
+            // afterward if nothing further changes.
+            highlight_color,
+            last_applied_highlight_color: highlight_color,
+            show_highlight_color_dialog: false,
             watch_enabled: watch,
             error_message: startup_error,
             is_dragging: false,
@@ -3817,6 +3835,64 @@ impl MarkdownApp {
         action
     }
 
+    fn render_highlight_color_settings(&mut self, ctx: &egui::Context) {
+        if !self.show_highlight_color_dialog {
+            return;
+        }
+
+        let mut open = true;
+        // Set inside the window closure, applied after `.show()` returns —
+        // same one-shot-flag pattern the font/tab-close deferred actions use
+        // elsewhere in this file.
+        let mut new_color: Option<Option<egui::Color32>> = None;
+
+        egui::Window::new("Highlight Color")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Color:");
+                    // Read the currently *effective* color (override or
+                    // theme default — update() already applied Visuals for
+                    // this frame) rather than re-deriving egui's own
+                    // dark/light selection defaults by hand.
+                    let mut color = ui.visuals().selection.bg_fill;
+                    let color_btn = ui.color_edit_button_srgba(&mut color);
+                    #[cfg(feature = "mcp")]
+                    self.mcp_bridge.register_widget(
+                        "Highlight Color Dialog: Color",
+                        "color",
+                        &color_btn,
+                        None,
+                    );
+                    if color_btn.changed() {
+                        new_color = Some(Some(color));
+                    }
+                });
+
+                let reset_btn = ui.add_enabled(
+                    self.highlight_color.is_some(),
+                    egui::Button::new("Reset to Default"),
+                );
+                #[cfg(feature = "mcp")]
+                self.mcp_bridge.register_widget(
+                    "Highlight Color Dialog: Reset",
+                    "button",
+                    &reset_btn,
+                    None,
+                );
+                if reset_btn.clicked() {
+                    new_color = Some(None);
+                }
+            });
+
+        self.show_highlight_color_dialog = open;
+        if let Some(color) = new_color {
+            self.highlight_color = color;
+        }
+    }
+
     fn render_lightbox(&mut self, ctx: &egui::Context) {
         let Some(lightbox) = &mut self.lightbox else {
             return;
@@ -4077,6 +4153,7 @@ impl eframe::App for MarkdownApp {
             zoom_level: Some(self.zoom_level),
             show_outline: Some(self.show_outline),
             full_width_content: Some(self.full_width_content),
+            highlight_color: self.highlight_color.map(|c| [c.r(), c.g(), c.b(), c.a()]),
             open_tabs: Some(self.get_open_tab_paths()),
             active_tab: Some(self.active_tab),
             show_explorer: Some(self.show_explorer),
@@ -4134,10 +4211,13 @@ impl eframe::App for MarkdownApp {
             std::thread::sleep(Duration::from_millis(16)); // ~60 FPS cap
         }
 
-        // Apply theme settings only when dark_mode changes
-        if self.last_applied_dark_mode != Some(self.dark_mode) {
+        // Apply theme settings when dark_mode or the highlight color changes
+        if self.last_applied_dark_mode != Some(self.dark_mode)
+            || self.last_applied_highlight_color != self.highlight_color
+        {
             self.last_applied_dark_mode = Some(self.dark_mode);
-            let visuals = if self.dark_mode {
+            self.last_applied_highlight_color = self.highlight_color;
+            let mut visuals = if self.dark_mode {
                 let mut v = egui::Visuals::dark();
                 v.panel_fill = egui::Color32::from_rgb(0x12, 0x12, 0x12);
                 v.window_fill = egui::Color32::from_rgb(0x12, 0x12, 0x12);
@@ -4152,6 +4232,9 @@ impl eframe::App for MarkdownApp {
                 v.override_text_color = Some(egui::Color32::from_rgb(0x33, 0x33, 0x33));
                 v
             };
+            if let Some(color) = self.highlight_color {
+                visuals.selection.bg_fill = color;
+            }
             ctx.set_visuals(visuals);
         }
 
@@ -4616,6 +4699,19 @@ impl eframe::App for MarkdownApp {
                         ui.close();
                     }
 
+                    let highlight_btn = ui.add(egui::Button::new("Highlight Color…"));
+                    #[cfg(feature = "mcp")]
+                    self.mcp_bridge.register_widget(
+                        "Menu: View → Highlight Color",
+                        "button",
+                        &highlight_btn,
+                        None,
+                    );
+                    if highlight_btn.clicked() {
+                        self.show_highlight_color_dialog = true;
+                        ui.close();
+                    }
+
                     ui.separator();
 
                     let zoom_in_btn = ui.add(egui::Button::new("Zoom In").shortcut_text("Ctrl++"));
@@ -4861,6 +4957,9 @@ impl eframe::App for MarkdownApp {
 
         // Lightbox overlay for enlarged diagrams or images
         self.render_lightbox(ctx);
+
+        // Highlight color picker window
+        self.render_highlight_color_settings(ctx);
 
         // Drag and drop overlay
         if self.is_dragging {
