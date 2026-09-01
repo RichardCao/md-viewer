@@ -1,18 +1,21 @@
-# Feature: Highlight Color Selection
+# Feature: Highlight & Link Color Selection
 
 **Status:** ✅ Complete
 **Branch:** `feature/highlight-color-selection`
 **Date:** 2026-09-01
-**Lines Changed:** +130 / -16 in `src/main.rs`
+**Lines Changed:** +130 / -16 in `src/main.rs` (highlight color) then +~85 / -~10 more (link color addition)
 
 ## Summary
 
 Lets the user pick the color egui uses to highlight *selected* UI elements —
-`Visuals::selection.bg_fill` (selected list/tab entries, text selection, etc).
-Prompted directly by user feedback after testing the font-selection feature:
-the font picker's selected-row highlight defaulted to egui's stock light blue
+`Visuals::selection.bg_fill` (selected list/tab entries, text selection, etc)
+— and, as a follow-up requested for the same PR, the hyperlink text color —
+`Visuals::hyperlink_color`. Both live in one `View → Colors…` window. Prompted
+directly by user feedback after testing the font-selection feature: the font
+picker's selected-row highlight defaulted to egui's stock light blue
 (`Color32::from_rgb(144, 209, 255)` in light mode), which the user doesn't
-like and wants to override via a color picker.
+like and wants to override via a color picker; link color was requested as an
+addition to that same PR shortly after.
 
 **Explicitly out of scope:** the yellow/orange Ctrl+F search-match highlight
 colors (`HighlightKind::background_color` in the vendored
@@ -33,6 +36,12 @@ saw in the font picker, not search highlighting. Not touched here.
 - [x] Reuses the existing dark/light `Visuals` rebuild block in `update()`
       (same one `last_applied_dark_mode` already gates) rather than adding a
       parallel apply-path
+- [x] `PersistedState.link_color: Option<[u8; 4]>` — same premultiplied-RGBA
+      encoding and same apply-on-change block, extended to also watch
+      `link_color` and set `visuals.hyperlink_color`
+- [x] Second, independent row in the same window ("Link Color:" + its own
+      Reset button); renamed the window/menu entry from "Highlight Color…" to
+      "Colors…" now that it manages two unrelated color settings
 
 ## Key Discoveries
 
@@ -96,6 +105,17 @@ codebase — give it its own `egui::Window` instead. The existing inline
 "Sort:" combo in the file explorer sidebar is fine specifically *because*
 it's not inside a menu popup — it's a plain sidebar `Ui`.
 
+### `Visuals::hyperlink_color` is the link-color equivalent of `Selection.bg_fill` — same pattern, no new plumbing
+
+Found by grepping the vendored renderer for where link color actually comes
+from: `egui_commonmark_backend/src/misc.rs:600` reads `ui.visuals().hyperlink_color`
+directly when formatting link text — it isn't a separate md-viewer or
+egui_commonmark setting. So the whole link-color feature is: one more
+`Option<Color32>` field, one more line in the same apply-on-change block
+(`visuals.hyperlink_color = color`), and one more labeled row + Reset button
+in the same window. No new persistence mechanism, no new apply path, no
+changes to the vendored crate at all.
+
 ## Architecture
 
 ### New/Modified Structs
@@ -103,31 +123,47 @@ it's not inside a menu popup — it's a plain sidebar `Ui`.
 ```rust
 // PersistedState
 highlight_color: Option<[u8; 4]>, // premultiplied RGBA; None = theme default
+link_color: Option<[u8; 4]>,      // same encoding
 
 // MarkdownApp
 highlight_color: Option<egui::Color32>,
 last_applied_highlight_color: Option<egui::Color32>, // Color32 is Copy — no clone needed
+link_color: Option<egui::Color32>,
+last_applied_link_color: Option<egui::Color32>,
 ```
 
 ### Modified apply-on-change block (`update()`)
 
-The existing dark-mode visuals rebuild now also fires when the highlight
-color changes, and applies the override after building the dark/light
-`Visuals` (unchanged construction otherwise):
+The existing dark-mode visuals rebuild now also fires when either color
+override changes, and applies both after building the dark/light `Visuals`
+(unchanged construction otherwise):
 
 ```rust
 if self.last_applied_dark_mode != Some(self.dark_mode)
     || self.last_applied_highlight_color != self.highlight_color
+    || self.last_applied_link_color != self.link_color
 {
     self.last_applied_dark_mode = Some(self.dark_mode);
     self.last_applied_highlight_color = self.highlight_color;
+    self.last_applied_link_color = self.link_color;
     let mut visuals = /* existing dark/light construction, unchanged */;
     if let Some(color) = self.highlight_color {
         visuals.selection.bg_fill = color;
     }
+    if let Some(color) = self.link_color {
+        visuals.hyperlink_color = color;
+    }
     ctx.set_visuals(visuals);
 }
 ```
+
+### Renamed identifiers
+
+`show_highlight_color_dialog` → `show_color_settings_dialog`,
+`render_highlight_color_settings` → `render_color_settings`. Once the window
+covered two unrelated settings, keeping the "highlight" name would have been
+misleading — internal names now track the "Colors" window title/menu entry
+rather than the first setting that happened to live there.
 
 ## Testing Notes
 
@@ -161,6 +197,16 @@ if self.last_applied_dark_mode != Some(self.dark_mode)
     investigated further since it reproduces the general "isolate per run"
     guidance already in `scripts/visual-regression.sh`'s comments — noting
     it here in case it recurs and turns out to be something real.
+- Link-color addition: same fmt/clippy/test pass, same clean result (56
+  passed, 1 ignored). Manual Xvfb pass: opened `View → Colors…`, confirmed
+  both rows render independently with their own Reset buttons; changed Link
+  Color to a coral/salmon and confirmed the document's actual `[test
+  link](url)` text (not just a UI chrome element) changed color live.
+  **First restart check falsely showed persistence failing** — see the new
+  `docs/LESSONS.md` entry ("`pkill -9` right after a settings change beats
+  eframe's 30s autosave") for why; a second attempt that waited past the
+  autosave interval (or, better, would use a graceful window-close) confirmed
+  persistence does work correctly.
 
 ## Future Improvements
 

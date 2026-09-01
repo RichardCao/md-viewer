@@ -486,6 +486,13 @@ ctx.request_repaint_after(Duration::from_millis(50)); // NOT request_repaint()
 **Note:** The error can be ignored; it's just polling to detect when the app is ready
 **Files:** `~/egui-mcp/crates/egui-mcp-bridge/src/server.rs`
 
+### `pkill -9` right after a settings change beats eframe's 30s autosave
+**Context:** Testing the highlight/link-color feature's restart persistence — changed the link color, killed the process almost immediately to relaunch and check, and the new color appeared to not persist (`app.ron` showed `link_color:None`).
+**Root cause:** eframe only calls `App::save()` in two situations: on a graceful shutdown (window-close event processed normally), or via `maybe_autosave()` on a fixed timer — `app.auto_save_interval()`, which defaults to `Duration::from_secs(30)` (`eframe-0.33.3/src/epi.rs`) and md-viewer doesn't override it. A `pkill -9` sends `SIGKILL`, which the process cannot intercept at all — no shutdown path runs, so any change made less than ~30s before the kill was never written to disk. This isn't a bug in the app; it's a property of testing via `SIGKILL` shortly after a state change.
+**Fix / how to test persistence correctly:** either (a) wait for the autosave interval before killing (confirm via `grep <field> app.ron` before killing, to catch the false negative immediately instead of only after relaunching), or (b) use a graceful close instead of `SIGKILL` — `xdotool windowclose <id>` sends a `WM_DELETE_WINDOW`-style close request that winit handles even without a window manager, running the normal shutdown/save path immediately.
+**General lesson:** when a persistence test appears to fail right after changing a setting, check the kill method and elapsed time before concluding there's a real bug — grep the actual persisted-state file (`app.ron` under `$XDG_DATA_HOME/md-viewer/`) to see whether the write happened at all, rather than trusting a single relaunch-and-look test.
+**Files:** N/A (testing methodology, not application code)
+
 ---
 
 ## Distribution / CI / Packaging
