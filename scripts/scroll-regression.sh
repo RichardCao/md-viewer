@@ -51,7 +51,8 @@ DOC="${2:-}"
 STEPS="${3:-150}"
 CLICKS="${4:-3}"
 TAG="scrollreg"
-DISPLAY_NUM=99
+# Override when :99 is occupied or wedged: MDV_DISPLAY=98 scripts/scroll-regression.sh
+DISPLAY_NUM="${MDV_DISPLAY:-99}"
 
 if [ ! -x "$BIN" ]; then
     echo "error: $BIN is not an executable — build it first (cargo build)" >&2
@@ -120,10 +121,14 @@ export XDG_DATA_HOME="/tmp/mdv-$TAG-data" XDG_CONFIG_HOME="/tmp/mdv-$TAG-config"
 
 FRAMES="/tmp/frames-$TAG"
 
+APP_PID=""
 cleanup() {
-    # Match process NAMES, not the full command line — a `pkill -f` pattern
-    # would also match this script and kill the run itself.
-    pkill -9 '^md-viewer$' 2>/dev/null
+    # Kill by recorded PID. Matching by name does not work reliably: Linux
+    # truncates a process's comm to 15 characters, so `pkill -x` misses any
+    # binary with a longer name (a copy called `mdv-main-7a6346c` shows up as
+    # `mdv-main-7a6346`), and `pkill -f` would match this script's own command
+    # line and kill the run itself.
+    [ -n "$APP_PID" ] && kill -9 "$APP_PID" 2>/dev/null
     true
 }
 trap cleanup EXIT
@@ -155,6 +160,7 @@ fi
 
 echo "== launching $BIN =="
 setsid "$BIN" --foreground "$DOC" </dev/null >"/tmp/mdv-$TAG.log" 2>&1 &
+APP_PID=$!
 sleep 5
 
 WINDOWS=$(xdotool search --name "Markdown Viewer" 2>/dev/null)
