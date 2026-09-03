@@ -51,9 +51,23 @@ Explorer and outline keep painting when the document pane goes blank, so a whole
 
 ## Result
 
-The guard is **red on main**, and that is deliberate. Its first run on the post-#113 build found a blank pane at the Section 6/7 table boundary that is unaffected by #113 and reproduces identically on `7b8f53b` — filed as #125. Tuning the guard until it passes would have reproduced the #96 mistake documented in LESSONS.md, where a regression test asserted the buggy behaviour as correct.
+The guard found a real bug on its first run: a blank pane at the Section 6/7 table boundary on the post-#113 build, unaffected by #113 and reproducing identically on `7b8f53b`. Filed as #125; #114 fixed it. Green on `main` as of 7a6346c.
 
-Not wired into CI while #125 is open.
+Tuning the guard until it passed would have reproduced the #96 mistake documented in LESSONS.md, where a regression test asserted the buggy behaviour as correct. Shipping it red was the right call at the time.
+
+### Verifying the fix needed a control run
+
+#114 changes table layout, so a clean run on the new build could just mean the blank moved out of the walk's path. Three measurements settle it:
+
+| build | mode | result |
+|---|---|---|
+| post-#113, pre-#114 | default | blank at f032 (196 content px) |
+| `main` 7a6346c | Full Width off | no blanks, bottom at frame 103 |
+| `main` 7a6346c | Full Width on | no blanks, f032 at 3152 content px |
+
+The first row is the control: the same harness, same session, same display still reports the blank on the old build, so the PASS on the new one is real. The two width modes are two different table geometries, so the absence is not an artefact of the one layout #114 optimises for.
+
+Now that it is green, it is a candidate for CI. Left out for the moment because it needs Xvfb, xdotool and ImageMagick, and takes roughly a hundred screenshots per run.
 
 ## Harness pitfalls
 

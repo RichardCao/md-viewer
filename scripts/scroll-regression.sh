@@ -30,11 +30,14 @@
 #     identical frames is only accepted once the end has been reached, which is
 #     the legitimate at-the-bottom case).
 #
-# EXPECTED RESULT TODAY: this script FAILS on main. The default fixture hits a
-# blank pane at the Section 6/7 table boundary, which is issue #125 — a second,
-# independent path that #113 did not address. That is a real finding, not a
-# harness problem; the script is a diagnostic tool, not yet a green gate. Once
-# #125 is fixed this should go green and can be wired into CI.
+# This guard earned its keep on the first run: against the build of the day it
+# found a blank pane at the fixture's Section 6/7 table boundary that #113 had
+# not addressed and that reproduced identically on 7b8f53b. That became #125,
+# and #114 fixed it. The guard is green on main as of 7a6346c.
+#
+# When it fails, check the control before believing the fix: re-run against the
+# previous build. A PASS only means something if the same harness still reports
+# FAIL on a build known to be broken.
 #
 # Usage:
 #   scripts/scroll-regression.sh [binary] [document.md] [steps] [clicks_per_step]
