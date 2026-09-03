@@ -2474,6 +2474,11 @@ impl CommonMarkCache {
         self.active_search_y = Some(self.current_scroll_offset + viewport_y);
     }
 
+    /// Record an active search position already expressed in document space.
+    pub fn record_active_search_content_y(&mut self, content_y: f32) {
+        self.active_search_y = Some(content_y);
+    }
+
     /// Get the recorded content-relative y of the active match, if it has rendered
     /// at least once since the active range was set. Used for precise scroll-into-view.
     pub fn active_search_y(&self) -> Option<f32> {

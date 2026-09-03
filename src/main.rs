@@ -1437,6 +1437,10 @@ fn find_matches(content: &str, query: &str) -> Vec<SearchMatch> {
     matches
 }
 
+fn take_search_correction_request(pending: &mut bool) -> bool {
+    std::mem::take(pending)
+}
+
 /// Check if header at `index` should be hidden because an ancestor is collapsed
 fn header_is_hidden(headers: &[Header], index: usize, collapsed: &HashSet<usize>) -> bool {
     if index == 0 || index >= headers.len() {
@@ -2713,10 +2717,9 @@ impl MarkdownApp {
             100.0
         };
         tab.pending_scroll_offset = Some((estimated_y - margin).max(0.0));
-        // Grant the post-render corrective block one frame of permission to
-        // snap to the renderer-recorded `active_search_y`. The block clears
-        // the flag after it runs, so subsequent frames (e.g. user wheeling
-        // away from the match) won't re-trigger snap-back. See Tab field doc.
+        // Grant the next render one full-paint attempt to record an exact Y.
+        // The request is consumed before that render even when the source
+        // match has no visible glyph, so later frames return to clipping.
         tab.correct_active_search_pending = true;
     }
 
@@ -3133,11 +3136,10 @@ impl MarkdownApp {
                     let estimated_y = (header.line_number as f32 / tab.content_lines as f32)
                         * tab.last_content_height;
                     tab.pending_scroll_offset = Some((estimated_y - 50.0).max(0.0));
+                    // The estimate only gets us near the target. Request one
+                    // complete paint so the corrective pass can measure it.
+                    tab.pending_header_click_key = Some(key);
                 }
-                // Remember the click target — once the bootstrap full paint
-                // triggered by `pending_scroll_offset` populates the cache, the
-                // corrective step in `render_tab_content` snaps to the precise y.
-                tab.pending_header_click_key = Some(key);
             }
         }
     }
@@ -3306,6 +3308,13 @@ impl MarkdownApp {
             tab.cache.clear_search_ranges();
         }
 
+        // A search correction grants exactly one full-paint attempt. Some
+        // source matches (for example Markdown syntax markers) have no
+        // rendered glyph and therefore never record a Y; do not let those
+        // matches disable viewport clipping forever.
+        let correct_search_this_frame =
+            take_search_correction_request(&mut tab.correct_active_search_pending);
+
         // Content area (no inner CentralPanel needed - we're already in one)
         // Left margin for breathing room, right margin prevents scrollbar/resize-handle overlap jitter
         egui::Frame::NONE
@@ -3324,6 +3333,8 @@ impl MarkdownApp {
                 // version through builder methods. The returned ScrollAreaOutput
                 // exposes state.offset and inner_rect for the post-render
                 // selection-preserving wheel hack below.
+                let force_full_render =
+                    tab.pending_header_click_key.is_some() || correct_search_this_frame;
                 let pending = tab.pending_scroll_offset.take();
                 let default_width = content_default_width(self.full_width_content);
                 let mut scroll_output = CommonMarkViewer::new()
@@ -3346,6 +3357,7 @@ impl MarkdownApp {
                     .heading_spacing_below(0.75)
                     .content_version(tab.content_version)
                     .pending_scroll_offset(pending)
+                    .force_full_render(force_full_render)
                     .scroll_source(egui::scroll_area::ScrollSource {
                         scroll_bar: true,
                         drag: false,
@@ -3367,7 +3379,7 @@ impl MarkdownApp {
                 // jump — without this gate the block would re-trigger every
                 // frame the active match is off-screen, fighting the user's
                 // wheel input and locking the view (issue #19).
-                if tab.correct_active_search_pending {
+                if correct_search_this_frame {
                     if let Some(actual_y) = tab.cache.active_search_y() {
                         let current_scroll = scroll_output.state.offset.y;
                         let viewport_top = current_scroll;
@@ -3385,9 +3397,6 @@ impl MarkdownApp {
                                 tab.pending_scroll_offset = Some(want_scroll);
                             }
                         }
-                        // Clear the one-shot regardless of which branch ran;
-                        // the corrective block has now had its chance to snap.
-                        tab.correct_active_search_pending = false;
                     }
                 }
 
@@ -5061,6 +5070,15 @@ mod tests {
             path_from_picker_output(bytes),
             Some(PathBuf::from("/tmp/example folder"))
         );
+    }
+
+    #[test]
+    fn search_correction_request_is_consumed_even_without_a_rendered_match() {
+        let mut pending = true;
+
+        assert!(take_search_correction_request(&mut pending));
+        assert!(!pending);
+        assert!(!take_search_correction_request(&mut pending));
     }
 
     #[test]

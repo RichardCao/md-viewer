@@ -120,6 +120,9 @@ pub struct CommonMarkViewer<'f> {
     /// owns the ScrollArea (via `show_scrollable`) the caller can no longer
     /// configure it directly.
     pending_scroll_offset: Option<f32>,
+    /// Whether this frame must paint the complete document instead of a
+    /// viewport slice. Navigation to an already measured Y does not need it.
+    force_full_render: bool,
     /// Scroll source config for the renderer-owned ScrollArea. Useful when
     /// the caller needs to disable drag-scroll (e.g. to keep text selection
     /// working) while preserving wheel-scroll.
@@ -440,6 +443,13 @@ impl<'f> CommonMarkViewer<'f> {
         self
     }
 
+    /// Paint the complete document this frame so off-screen target positions
+    /// can be measured. Keep this disabled for scrolling to a cached position.
+    pub fn force_full_render(mut self, force: bool) -> Self {
+        self.force_full_render = force;
+        self
+    }
+
     /// Configure which scroll inputs the renderer-owned ScrollArea reacts to.
     ///
     /// Default is whatever `egui::ScrollArea::vertical()` provides. Callers
@@ -538,6 +548,7 @@ impl<'f> CommonMarkViewer<'f> {
             text,
             self.content_version,
             self.pending_scroll_offset,
+            self.force_full_render,
             self.scroll_source,
         )
     }

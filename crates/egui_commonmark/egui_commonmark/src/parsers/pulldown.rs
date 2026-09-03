@@ -390,6 +390,27 @@ fn forward_shift_wheel_to_horizontal_scroll<R>(
     }
 }
 
+fn markdown_table_id(source_id: Id, source_start: usize) -> Id {
+    source_id.with("_markdown_table").with(source_start)
+}
+
+fn content_relative_y(screen_y: f32, render_origin_y: f32, slice_start_y: f32) -> f32 {
+    slice_start_y + screen_y - render_origin_y
+}
+
+fn record_active_search_content_y(
+    cache: &mut CommonMarkCache,
+    screen_y: f32,
+    render_origin_y: f32,
+    slice_start_y: f32,
+) {
+    cache.record_active_search_content_y(content_relative_y(
+        screen_y,
+        render_origin_y,
+        slice_start_y,
+    ));
+}
+
 /// Newline logic is constructed by the following:
 /// All elements try to insert a newline before them (if they are allowed)
 /// and end their own line.
@@ -449,6 +470,7 @@ struct DefinitionList {
 pub struct CommonMarkViewerInternal {
     curr_table: usize,
     curr_code_block: usize,
+    source_id: Option<Id>,
     text_style: Style,
     list: List,
     link: Option<Link>,
@@ -470,6 +492,12 @@ pub struct CommonMarkViewerInternal {
     current_heading_text: String,
     /// Accumulate heading RichText fragments for single render at end
     current_heading_rich_texts: Vec<egui::RichText>,
+    /// Content-space Y of the first event rendered by the current slice.
+    slice_start_y: f32,
+    /// Screen-space Y of the root UI for the current full or sliced render.
+    /// Nested table/list/blockquote UIs must not replace this origin when
+    /// converting navigation positions into document coordinates.
+    render_origin_y: f32,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -482,6 +510,7 @@ impl CommonMarkViewerInternal {
         Self {
             curr_table: 0,
             curr_code_block: 0,
+            source_id: None,
             text_style: Style::default(),
             list: List::default(),
             link: None,
@@ -498,6 +527,8 @@ impl CommonMarkViewerInternal {
             current_heading_source_start: None,
             current_heading_text: String::new(),
             current_heading_rich_texts: Vec::new(),
+            slice_start_y: 0.0,
+            render_origin_y: 0.0,
         }
     }
 }
@@ -713,6 +744,7 @@ impl CommonMarkViewerInternal {
         text: &str,
         split_points_id: Option<Id>,
     ) -> (egui::InnerResponse<()>, Vec<CheckboxClickEvent>) {
+        self.slice_start_y = 0.0;
         let max_width = options.max_width(ui);
         let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
 
@@ -738,12 +770,14 @@ impl CommonMarkViewerInternal {
             ui.set_row_height(height);
             let content_origin_y = ui.next_widget_position().y;
             let content_origin_x = ui.max_rect().left();
+            self.render_origin_y = content_origin_y;
 
             // Use cached events — clone the Vec reference data for iteration
             // (events are 'static so this is cheap pointer copies, not re-parsing)
             let events_data = cache.get_cached_events(content_hash)
                 .expect("events just cached")
                 .to_vec();
+            let event_count = events_data.len();
             let mut events = events_data
                 .into_iter()
                 .enumerate()
@@ -762,6 +796,14 @@ impl CommonMarkViewerInternal {
                     &e,
                     pulldown_cmark::Event::End(end) if is_block_end_tag(end)
                 );
+                // `table()` consumes the complete table, including its End
+                // event, from `events`. The outer loop therefore never sees
+                // TagEnd::Table and must record that block boundary from its
+                // Start event after processing finishes.
+                let is_atomic_table = matches!(
+                    &e,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))
+                );
 
                 if events.peek().is_none() {
                     self.line.should_end_newline_forced = false;
@@ -770,8 +812,9 @@ impl CommonMarkViewerInternal {
                 self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
 
                 // Defense in depth: only add a split point when we're at a
-                // block end AND outside any stateful container (list, table,
-                // blockquote). The viewport-skip path in `show_scrollable`
+                // block end (or just consumed an atomic table) AND outside any
+                // stateful container (list, table, blockquote). The
+                // viewport-skip path in `show_scrollable`
                 // recreates the renderer with `CommonMarkViewerInternal::new`
                 // each frame, so the transient state of `self.list`,
                 // `self.is_table`, and `self.is_blockquote` is *not* replayed
@@ -784,7 +827,7 @@ impl CommonMarkViewerInternal {
                 // check below must run after `process_event` (above) since
                 // that's where the start/end of these containers updates
                 // `self.list` / `self.is_table` / `self.is_blockquote`.
-                let safe_for_split = is_block_end
+                let safe_for_split = (is_block_end || is_atomic_table)
                     && !self.list.is_inside_a_list()
                     && !self.is_table
                     && !self.is_blockquote;
@@ -794,7 +837,14 @@ impl CommonMarkViewerInternal {
                         let scroll_cache = scroll_cache(cache, &source_id);
                         let end_position = ui.next_widget_position();
 
-                        let split_index = index.saturating_add(1);
+                        let split_index = if is_atomic_table {
+                            events
+                                .peek()
+                                .map(|(next_index, _)| *next_index)
+                                .unwrap_or(event_count)
+                        } else {
+                            index.saturating_add(1)
+                        };
                         let split_point_exists = scroll_cache
                             .split_points
                             .iter()
@@ -851,8 +901,10 @@ impl CommonMarkViewerInternal {
         text: &str,
         content_version: Option<u64>,
         pending_scroll_offset: Option<f32>,
+        force_full_render: bool,
         scroll_source: Option<egui::scroll_area::ScrollSource>,
     ) -> egui::scroll_area::ScrollAreaOutput<()> {
+        self.source_id = Some(source_id);
         let available_size = ui.available_size();
         let scroll_id = source_id.with("_scroll_area");
         let layout_sig = compute_layout_signature(ui, options);
@@ -910,21 +962,17 @@ impl CommonMarkViewerInternal {
                 sc.page_size = None;
                 sc.split_points.clear();
             }
-            // When the caller wants to jump to a specific scroll position
-            // (outline click, search-jump), we must paint *every* event
-            // this frame — not just the viewport-clipped subset. Otherwise
-            // a far target's block doesn't paint, the cache.active_search_y
-            // / header_position never gets recorded, and the two-stage
-            // corrective scroll (src/main.rs:scroll_to_active_match) can't
-            // snap to the precise y. Forcing the bootstrap branch costs one
-            // full-paint frame (~100 ms at 100k lines) per jump, which is
-            // acceptable for a one-off action.
+            // An unknown navigation target may require painting every event
+            // so its precise position can be measured. Scrolling to an
+            // already cached Y must not take this path: nested virtualized
+            // widgets can report different off-screen heights during a
+            // nonzero-offset full paint and overwrite valid coordinates.
             //
             // Keep the already-valid split points: this bootstrap is needed
             // to paint every event for the jump, not to recompute geometry.
             // The push site deduplicates by event index, so the full render
             // can still refresh page_size without rebuilding the split list.
-            if pending_scroll_offset.is_some() {
+            if force_full_render {
                 sc.page_size = None;
             }
         }
@@ -995,13 +1043,15 @@ impl CommonMarkViewerInternal {
             let (first_event_index, first_end_y, events_range) = {
                 let scroll_cache = scroll_cache(cache, &source_id);
 
-                // Keep one complete block of safety margin on both sides of
-                // the viewport, and only resume after a complete block.
+                // Resume after the last complete block above the viewport.
+                // Re-rendering an additional fully off-screen table here is
+                // unsafe: egui_extras virtualizes all of its heterogeneous
+                // rows and can report a collapsed height for that table.
                 let above = scroll_cache
                     .split_points
                     .partition_point(|(_, _, end)| end.y < viewport.min.y);
-                let (first_event_index, _, first_end_position) = if above >= 2 {
-                    scroll_cache.split_points[above - 2]
+                let (first_event_index, _, first_end_position) = if above >= 1 {
+                    scroll_cache.split_points[above - 1]
                 } else {
                     (0, Pos2::ZERO, Pos2::ZERO)
                 };
@@ -1043,6 +1093,8 @@ impl CommonMarkViewerInternal {
             ui.scope_builder(
                 egui::UiBuilder::new().max_rect(slice_rect).layout(layout),
                 |ui| {
+                    self.slice_start_y = first_end_y;
+                    self.render_origin_y = ui.min_rect().top();
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.set_row_height(ui.text_style_height(&TextStyle::Body));
 
@@ -1110,11 +1162,23 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
         max_width: f32,
     ) {
+        let table_source_start = matches!(
+            &event,
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Table(_))
+        )
+        .then_some(src_span.start);
         self.event(ui, event, src_span, cache, options, max_width);
 
         self.def_list_def_wrapping(events, max_width, cache, options, ui);
         self.item_list_wrapping(events, max_width, cache, options, ui);
-        self.table(events, cache, options, ui, max_width);
+        self.table(
+            events,
+            cache,
+            options,
+            ui,
+            max_width,
+            table_source_start,
+        );
         self.blockquote(events, max_width, cache, options, ui);
     }
 
@@ -1261,11 +1325,15 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
         ui: &mut Ui,
         max_width: f32,
+        source_start: Option<usize>,
     ) {
         if self.is_table {
             self.line.try_insert_start(ui);
 
-            let id = ui.id().with("_table").with(self.curr_table);
+            let id = markdown_table_id(
+                self.source_id.unwrap_or_else(|| ui.id()),
+                source_start.unwrap_or(self.curr_table),
+            );
             self.curr_table += 1;
 
             // Consume events into header/rows up front so we know the column count
@@ -1674,7 +1742,7 @@ impl CommonMarkViewerInternal {
             },
         );
         if let Some(y) = active_y {
-            cache.record_active_search_y_viewport(y);
+            record_active_search_content_y(cache, y, self.render_origin_y, self.slice_start_y);
         }
     }
 
@@ -1789,7 +1857,7 @@ impl CommonMarkViewerInternal {
             );
         });
         if let Some(y) = active_y {
-            cache.record_active_search_y_viewport(y);
+            record_active_search_content_y(cache, y, self.render_origin_y, self.slice_start_y);
         }
     }
 
@@ -1967,25 +2035,29 @@ impl CommonMarkViewerInternal {
                         // SCREEN-y coordinate. The click handler uses the
                         // cached value with `ScrollArea::vertical_scroll_offset(N)`,
                         // which interprets N as a CONTENT-y (where 0 is the
-                        // top of the ScrollArea's content layout). Subtract
-                        // `ui.min_rect().top()` — that's the screen y of the
-                        // closure's ui top-left, which tracks the current
-                        // scroll offset (it shifts up as the user scrolls).
-                        // The subtraction cancels out both the panel chrome
-                        // AND any active scroll offset, leaving a pure
-                        // content-y that's invariant across scroll positions.
+                        // top of the ScrollArea's content layout). Subtract the
+                        // root render origin, which tracks the current scroll
+                        // offset but stays stable across nested table, list,
+                        // and blockquote UIs. This cancels out both the panel
+                        // chrome and any active scroll offset. A viewport slice
+                        // starts at `slice_start_y` rather than document y=0,
+                        // so add that origin back before updating the cache.
                         //
                         // Empirical verification on Recent-Changes.md:
-                        // - At scroll=0: title cursor=323, min_rect.top()=44
+                        // - At scroll=0: title cursor=323, render origin=44
                         //   → content_y = 279
                         // - After click to scroll=273: cursor=50,
-                        //   min_rect.top()=-229 → content_y = 279
+                        //   render origin=-229 → content_y = 279
                         // - Same heading, same content_y, regardless of scroll
                         //
                         // Previously stored `cur_offset + cursor.y` which gave
                         // 323 (off by 44 = panel chrome height), so scrolling
                         // to (323-50)=273 landed 44 px past the heading.
-                        let content_y = y - ui.min_rect().top();
+                        let content_y = content_relative_y(
+                            y,
+                            self.render_origin_y,
+                            self.slice_start_y,
+                        );
                         // Always refresh with current layout, not first-paint
                         // value. First-paint pinning produced increasing
                         // overshoot for deeper headers — the first frame
@@ -2371,6 +2443,7 @@ mod tests {
                 markdown,
                 Some(1),
                 None,
+                false,
                 None,
             );
             let sc = scroll_cache(&mut cache, &source_id);
@@ -2384,6 +2457,17 @@ mod tests {
                     );
                 }
             }
+            let table_end_index = sc
+                .events
+                .iter()
+                .position(|(event, _)| matches!(event, Event::End(pulldown_cmark::TagEnd::Table)))
+                .expect("fixture contains a table end");
+            assert!(
+                sc.split_points
+                    .iter()
+                    .any(|(index, _, _)| *index == table_end_index + 1),
+                "atomic table must leave a safe resume point after its consumed End event"
+            );
 
             CommonMarkViewerInternal::new().show_scrollable(
                 source_id,
@@ -2393,6 +2477,7 @@ mod tests {
                 markdown,
                 Some(1),
                 None,
+                false,
                 None,
             );
         });
@@ -2725,6 +2810,96 @@ mod tests {
             assert!(cache.get_header_position("heading-source:0").is_some());
             assert!(cache.get_header_position("heading-source:20").is_some());
         });
+    }
+
+    #[test]
+    fn sliced_heading_position_includes_the_slice_origin() {
+        assert_eq!(content_relative_y(50.0, -229.0, 0.0), 279.0);
+        assert_eq!(content_relative_y(120.0, 80.0, 1_976.0), 2_016.0);
+    }
+
+    #[test]
+    fn sliced_search_position_includes_origin_and_excludes_chrome() {
+        let mut cache = CommonMarkCache::default();
+
+        record_active_search_content_y(&mut cache, 120.0, 80.0, 1_976.0);
+
+        assert_eq!(cache.active_search_y(), Some(2_016.0));
+    }
+
+    #[test]
+    fn nested_navigation_positions_keep_the_root_render_origin() {
+        let markdown = concat!(
+            "Paragraph one.\n\n",
+            "Paragraph two.\n\n",
+            "Paragraph three.\n\n",
+            "Paragraph four.\n\n",
+            "> ## Nested heading\n",
+            "> quoted text\n\n",
+            "| Key | Value |\n",
+            "|---|---|\n",
+            "| row | ACTIVE_TABLE_MATCH |\n",
+        );
+        let active_start = markdown.find("ACTIVE_TABLE_MATCH").unwrap();
+        let active_range = active_start..active_start + "ACTIVE_TABLE_MATCH".len();
+        let heading_source_start = crate::parsers::latex_delimiters::parse_events(markdown, false)
+            .into_iter()
+            .find_map(|(event, range)| {
+                matches!(event, Event::Start(Tag::Heading { .. })).then_some(range.start)
+            })
+            .expect("fixture contains a nested heading");
+        let heading_key = crate::header_position_key(heading_source_start);
+        let mut cache = CommonMarkCache::default();
+        cache.set_search_ranges(vec![active_range.clone()]);
+        cache.set_active_search_range(Some(active_range));
+        let ctx = egui::Context::default();
+        let mut minimum_nested_y = 0.0;
+
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            ui.set_width(400.0);
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+            minimum_nested_y = line_height * 4.0;
+            CommonMarkViewerInternal::new().show(
+                ui,
+                &mut cache,
+                &CommonMarkOptions::default(),
+                markdown,
+                None,
+            );
+        });
+        let _ = ctx.end_pass();
+
+        assert!(
+            cache
+                .get_header_position(&heading_key)
+                .is_some_and(|y| y > minimum_nested_y),
+            "nested heading lost the preceding document height"
+        );
+        assert!(
+            cache
+                .active_search_y()
+                .is_some_and(|y| y > minimum_nested_y),
+            "table-cell search match lost the preceding document height"
+        );
+    }
+
+    #[test]
+    fn markdown_table_identity_uses_document_and_source_position() {
+        let document = Id::new("document-a");
+
+        assert_eq!(
+            markdown_table_id(document, 120),
+            markdown_table_id(document, 120)
+        );
+        assert_ne!(
+            markdown_table_id(document, 120),
+            markdown_table_id(document, 240)
+        );
+        assert_ne!(
+            markdown_table_id(document, 120),
+            markdown_table_id(Id::new("document-b"), 120)
+        );
     }
 
     #[test]
