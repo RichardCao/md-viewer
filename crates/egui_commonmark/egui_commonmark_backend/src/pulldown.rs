@@ -130,6 +130,11 @@ fn parse_row<'e>(
         if let pulldown_cmark::Event::End(pulldown_cmark::TagEnd::TableCell) = e {
             row.push(column);
             column = Vec::new();
+            // The boundary belongs between cells, not at the start of the
+            // following cell. Keeping it in `column` makes the renderer's
+            // TableCell-end handler paint a two-space label before every
+            // column after the first, changing its wrap point and row height.
+            continue;
         }
 
         if let pulldown_cmark::Event::End(pulldown_cmark::TagEnd::TableHead) = e {
@@ -353,5 +358,29 @@ mod tests {
         let mut iter = events.into_iter().enumerate();
         let collected = delayed_events_list_item(&mut iter);
         assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn parsed_table_cells_do_not_keep_neighbor_boundaries() {
+        let md = "| first | second |\n|---|---|\n| alpha | beta |";
+        let events: Vec<_> = Parser::new_ext(md, parser_options())
+            .into_offset_iter()
+            .map(|(event, range)| (event.into_static(), range))
+            .collect();
+        let table_start = events
+            .iter()
+            .position(|(event, _)| matches!(event, Event::Start(Tag::Table(_))))
+            .expect("table start");
+        let mut iter = events.into_iter().enumerate().skip(table_start + 1);
+        let table = parse_table(&mut iter);
+
+        for cell in table.header.iter().chain(table.rows.iter().flatten()) {
+            assert!(
+                !cell
+                    .iter()
+                    .any(|(event, _)| matches!(event, Event::End(TagEnd::TableCell))),
+                "cell boundary leaked into visible cell events: {cell:?}"
+            );
+        }
     }
 }

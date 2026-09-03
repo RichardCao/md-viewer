@@ -324,6 +324,23 @@ AFTER_MIXED_TABLE";
 }
 
 #[test]
+fn selected_family_style_table_has_no_vertically_clipped_text() {
+    let table = "\
+| a | b | c | d | e | f | g | h | i | j | k | l | m |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | `ccofi_anchor_queue_alignment` | snapshot5_cross20_broad10 | 0.026103 | 0.535295 | 0.464705 | 0.940817 | +0.000075270 ([+0.000034283, +0.000116016]) | +0.000033623 | +0.000151384 | 0.131561 | 0.074240/0.009615/0.192383 | [IF](if) / [IH](ih) / [IC](ic) / [IM](im) |";
+    let (_, _, painted) = render_geometry(table, 640.0);
+    let clipped: Vec<_> = painted
+        .iter()
+        .filter(|entry| {
+            entry.rect.top() < entry.clip_rect.top() - 0.5
+                || entry.rect.bottom() > entry.clip_rect.bottom() + 0.5
+        })
+        .collect();
+    assert!(clipped.is_empty(), "{clipped:#?}");
+}
+
+#[test]
 #[cfg(feature = "math")]
 fn markdown_table_wraps_text_around_inline_math_without_clipping() {
     let markdown = "\
