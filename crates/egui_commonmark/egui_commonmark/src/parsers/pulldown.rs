@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
 use std::ops::Range;
 
@@ -472,6 +475,7 @@ fn table_cell_height(
         height += inline_math_height
             + (ui.spacing().item_spacing.y + 1.0) * inline_math_count as f32;
     }
+
     height
 }
 
@@ -494,6 +498,42 @@ fn markdown_cell_text(cell: &[(pulldown_cmark::Event, Range<usize>)]) -> String 
         }
     }
     text
+}
+
+fn markdown_table_digest(rows: &[Vec<Vec<(pulldown_cmark::Event, Range<usize>)>>]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for row in rows {
+        row.len().hash(&mut hasher);
+        for cell in row {
+            cell.len().hash(&mut hasher);
+            for (event, source) in cell {
+                // Preserve formatting identity as well as visible text: the same
+                // bytes can wrap differently as prose, inline code, or a link.
+                let _ = write!(HasherWriter(&mut hasher), "{event:?}");
+                source.start.hash(&mut hasher);
+                source.end.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+struct HasherWriter<'a, H>(&'a mut H);
+
+impl<H: Hasher> std::fmt::Write for HasherWriter<'_, H> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0.write(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn html_table_digest(rows: &[(bool, &[String])]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (is_header, row) in rows {
+        is_header.hash(&mut hasher);
+        row.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn natural_text_width(ui: &Ui, text: &str) -> f32 {
@@ -615,6 +655,292 @@ fn fit_column_widths(desired: &[f32], available: f32, minimums: &[f32]) -> Vec<f
             (FAIR_WEIGHT * fair + (1.0 - FAIR_WEIGHT) * proportional) as f32
         })
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct HeightAwareTableLayout {
+    key: u64,
+    widths: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TableHeightScore {
+    row_max_total: f32,
+    cell_total: f32,
+}
+
+fn table_height_score(
+    widths: &[f32],
+    row_count: usize,
+    measurements: &mut HashMap<(usize, u32), Vec<f32>>,
+    measurement_limit: usize,
+    measure_column: &mut impl FnMut(usize, f32) -> Vec<f32>,
+) -> Option<TableHeightScore> {
+    let mut row_maxima = vec![0.0_f32; row_count];
+    let mut cell_total = 0.0;
+    for (column, &width) in widths.iter().enumerate() {
+        let measurement_key = (column, width.to_bits());
+        if !measurements.contains_key(&measurement_key)
+            && measurements.len() >= measurement_limit
+        {
+            return None;
+        }
+        let heights = measurements
+            .entry(measurement_key)
+            .or_insert_with(|| measure_column(column, width));
+        for (row, &height) in heights.iter().enumerate().take(row_count) {
+            row_maxima[row] = row_maxima[row].max(height);
+            cell_total += height;
+        }
+    }
+    Some(TableHeightScore {
+        row_max_total: row_maxima.into_iter().sum(),
+        cell_total,
+    })
+}
+
+fn reduces_table_height(candidate: TableHeightScore, current: TableHeightScore) -> bool {
+    const MEANINGFUL_HEIGHT: f32 = 0.25;
+    candidate.row_max_total < current.row_max_total - MEANINGFUL_HEIGHT
+}
+
+fn better_table_height(candidate: TableHeightScore, current: TableHeightScore) -> bool {
+    const MEANINGFUL_HEIGHT: f32 = 0.25;
+    reduces_table_height(candidate, current)
+        || ((candidate.row_max_total - current.row_max_total).abs() <= MEANINGFUL_HEIGHT
+            && candidate.cell_total < current.cell_total - MEANINGFUL_HEIGHT)
+}
+
+fn columns_at_row_max(
+    widths: &[f32],
+    row_count: usize,
+    measurements: &HashMap<(usize, u32), Vec<f32>>,
+) -> Vec<bool> {
+    const MEANINGFUL_HEIGHT: f32 = 0.25;
+    let mut row_maxima = vec![0.0_f32; row_count];
+    for (column, width) in widths.iter().enumerate() {
+        let heights = &measurements[&(column, width.to_bits())];
+        for (row, height) in heights.iter().enumerate().take(row_count) {
+            row_maxima[row] = row_maxima[row].max(*height);
+        }
+    }
+
+    widths
+        .iter()
+        .enumerate()
+        .map(|(column, width)| {
+            measurements[&(column, width.to_bits())]
+                .iter()
+                .enumerate()
+                .take(row_count)
+                .any(|(row, height)| *height >= row_maxima[row] - MEANINGFUL_HEIGHT)
+        })
+        .collect()
+}
+
+/// Refine the deterministic natural-width allocation using the row heights
+/// that the production table renderer will actually reserve. Width moves are
+/// bounded and quantized, so the work stays predictable even for large tables.
+fn optimize_fitted_widths(
+    baseline: &[f32],
+    desired: &[f32],
+    minimums: &[f32],
+    row_count: usize,
+    mut measure_column: impl FnMut(usize, f32) -> Vec<f32>,
+) -> Vec<f32> {
+    const WIDTH_STEP: f32 = 8.0;
+    const MAX_PASSES: usize = 8;
+    const MAX_PAIR_STEPS: usize = 8;
+    const MAX_MEASURED_CELLS: usize = 4_096;
+
+    if baseline.len() < 2
+        || baseline.len() != desired.len()
+        || baseline.len() != minimums.len()
+        || row_count == 0
+    {
+        return baseline.to_vec();
+    }
+
+    let can_transfer = (0..baseline.len()).any(|donor| {
+        baseline[donor] > minimums[donor] + 0.01
+            && (0..baseline.len()).any(|receiver| {
+                receiver != donor
+                    && baseline[receiver] + 0.01
+                        < desired[receiver].max(minimums[receiver])
+            })
+    });
+    if !can_transfer {
+        return baseline.to_vec();
+    }
+
+    let mut widths = baseline.to_vec();
+    let mut measurements = HashMap::new();
+    let measurement_limit = MAX_MEASURED_CELLS / row_count;
+    if measurement_limit < baseline.len() {
+        return baseline.to_vec();
+    }
+    let mut score = table_height_score(
+        &widths,
+        row_count,
+        &mut measurements,
+        measurement_limit,
+        &mut measure_column,
+    )
+    .expect("the baseline fits the checked measurement budget");
+    let mut best_widths = widths.clone();
+    let mut used_neutral_move = false;
+
+    for _ in 0..MAX_PASSES {
+        // Widening a column that is below every current row maximum cannot
+        // reduce table height. Recompute after each accepted move so a column
+        // that becomes the new maximum remains eligible on the next pass.
+        let relevant_receivers = columns_at_row_max(&widths, row_count, &measurements);
+        let mut best: Option<(TableHeightScore, usize, usize, f32)> = None;
+        for donor in 0..widths.len() {
+            let donor_room = widths[donor] - minimums[donor];
+            if donor_room <= 0.01 {
+                continue;
+            }
+            for receiver in 0..widths.len() {
+                if donor == receiver || !relevant_receivers[receiver] {
+                    continue;
+                }
+                let receiver_room = desired[receiver].max(minimums[receiver]) - widths[receiver];
+                let max_transfer = donor_room.min(receiver_room);
+                if max_transfer <= 0.01 {
+                    continue;
+                }
+
+                // Wrapping height is a staircase: one quantum can sit on a
+                // flat section even though a later quantum removes a line.
+                // Check every 8 px step through the bounded 64 px window.
+                for step in 1..=MAX_PAIR_STEPS {
+                    let transfer = WIDTH_STEP * step as f32;
+                    if transfer > max_transfer + 0.01 {
+                        break;
+                    }
+                    let mut candidate_widths = widths.clone();
+                    candidate_widths[donor] -= transfer;
+                    candidate_widths[receiver] += transfer;
+                    let Some(candidate) = table_height_score(
+                        &candidate_widths,
+                        row_count,
+                        &mut measurements,
+                        measurement_limit,
+                        &mut measure_column,
+                    ) else {
+                        return best_widths;
+                    };
+                    if !better_table_height(candidate, score) {
+                        continue;
+                    }
+                    let replace =
+                        best.is_none_or(|(best_score, best_donor, best_receiver, _)| {
+                            better_table_height(candidate, best_score)
+                                || (!better_table_height(best_score, candidate)
+                                    && (donor, receiver) < (best_donor, best_receiver))
+                        });
+                    if replace {
+                        best = Some((candidate, donor, receiver, transfer));
+                    }
+                }
+            }
+        }
+
+        let Some((next_score, donor, receiver, transfer)) = best else {
+            break;
+        };
+        let reduces_rows = reduces_table_height(next_score, score);
+        // Cross at most one flat step (enough for two tied row maxima). If the
+        // following move still does not reduce the sum of row maxima, stop and
+        // return the last primary improvement. Exhausting the measurement
+        // budget follows the same rollback path above. Wider plateaus remain
+        // deliberately out of scope for this bounded Phase 1 heuristic.
+        if !reduces_rows && used_neutral_move {
+            break;
+        }
+        widths[donor] -= transfer;
+        widths[receiver] += transfer;
+        score = next_score;
+        if reduces_rows {
+            best_widths.clone_from(&widths);
+            used_neutral_move = false;
+        } else {
+            used_neutral_move = true;
+        }
+    }
+    best_widths
+}
+
+fn table_layout_key(
+    ui: &Ui,
+    desired: &[f32],
+    minimums: &[f32],
+    table_bound: f32,
+    line_height: f32,
+    content_digest: u64,
+    layout_revision: u64,
+    math_scale: f32,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    desired.len().hash(&mut hasher);
+    for width in desired {
+        width.to_bits().hash(&mut hasher);
+    }
+    for width in minimums {
+        width.to_bits().hash(&mut hasher);
+    }
+    table_bound.round().to_bits().hash(&mut hasher);
+    line_height.to_bits().hash(&mut hasher);
+    let body_font = egui::TextStyle::Body.resolve(ui.style());
+    let monospace_font = egui::TextStyle::Monospace.resolve(ui.style());
+    body_font.size.to_bits().hash(&mut hasher);
+    let _ = write!(HasherWriter(&mut hasher), "{:?}", body_font.family);
+    monospace_font.size.to_bits().hash(&mut hasher);
+    let _ = write!(HasherWriter(&mut hasher), "{:?}", monospace_font.family);
+    ui.ctx().pixels_per_point().to_bits().hash(&mut hasher);
+    content_digest.hash(&mut hasher);
+    layout_revision.hash(&mut hasher);
+    math_scale.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_height_aware_widths(
+    ui: &Ui,
+    table_id: Id,
+    key: u64,
+    baseline: &[f32],
+    desired: &[f32],
+    minimums: &[f32],
+    row_count: usize,
+    measure_column: impl FnMut(usize, f32) -> Vec<f32>,
+) -> (Vec<f32>, bool) {
+    let cache_id = table_id.with("_height_aware_widths");
+    let previous = ui.data(|data| data.get_temp::<HeightAwareTableLayout>(cache_id));
+    if let Some(cached) = &previous {
+        if cached.key == key {
+            return (cached.widths.clone(), false);
+        }
+    }
+    let had_previous_layout = previous.is_some();
+
+    let widths = optimize_fitted_widths(
+        baseline,
+        desired,
+        minimums,
+        row_count,
+        measure_column,
+    );
+    ui.data_mut(|data| {
+        data.insert_temp(
+            cache_id,
+            HeightAwareTableLayout {
+                key,
+                widths: widths.clone(),
+            },
+        );
+    });
+    (widths, had_previous_layout)
 }
 
 /// Fit columns inside the table's outer width contract.
@@ -1711,8 +2037,37 @@ impl CommonMarkViewerInternal {
                         .fold(40.0, f32::max)
                 })
                 .collect();
-            let (table_frame, initial_widths) =
+            let (table_frame, baseline_widths) =
                 framed_table_widths(ui, &desired_widths, &minimum_widths, table_bound);
+            let layout_key = table_layout_key(
+                ui,
+                &desired_widths,
+                &minimum_widths,
+                table_bound,
+                line_h,
+                markdown_table_digest(&table_rows),
+                cache.layout_revision(),
+                options.math_scale,
+            );
+            let (initial_widths, height_layout_changed) = cached_height_aware_widths(
+                ui,
+                id,
+                layout_key,
+                &baseline_widths,
+                &desired_widths,
+                &minimum_widths,
+                table_rows.len(),
+                |column, width| {
+                    table_rows
+                        .iter()
+                        .map(|row| {
+                            row.get(column).map_or(0.0, |cell| {
+                                table_cell_height(cell, line_h, cache, ui, width, options)
+                            })
+                        })
+                        .collect()
+                },
+            );
             // The document ui is allocated at the prose width, and a child ui
             // can never exceed its parent's allocation — so a wider viewport
             // must be carved out explicitly. egui does not clamp an explicit
@@ -1769,7 +2124,8 @@ impl CommonMarkViewerInternal {
                             ui.vertical(|ui| {
                                 table_frame.show(ui, |ui| {
                                     let reset_column_widths =
-                                        table_layout_bound_changed(ui, id, table_bound);
+                                        table_layout_bound_changed(ui, id, table_bound)
+                                            || height_layout_changed;
                                     let mut builder = egui_extras::TableBuilder::new(ui)
                                         .id_salt(id.with("_wrapped"))
                                         .striped(true)
@@ -2623,8 +2979,37 @@ impl CommonMarkViewerInternal {
                     .fold(40.0, f32::max)
             })
             .collect();
-        let (table_frame, initial_widths) =
+        let (table_frame, baseline_widths) =
             framed_table_widths(ui, &desired_widths, &minimum_widths, table_bound);
+        let layout_key = table_layout_key(
+            ui,
+            &desired_widths,
+            &minimum_widths,
+            table_bound,
+            line_h,
+            html_table_digest(&table_rows),
+            0,
+            1.0,
+        );
+        let (initial_widths, height_layout_changed) = cached_height_aware_widths(
+            ui,
+            id,
+            layout_key,
+            &baseline_widths,
+            &desired_widths,
+            &minimum_widths,
+            table_rows.len(),
+            |column, width| {
+                table_rows
+                    .iter()
+                    .map(|(_, row)| {
+                        row.get(column).map_or(0.0, |cell| {
+                            wrapped_text_height(ui, cell, width - 16.0, line_h) + 8.0
+                        })
+                    })
+                    .collect()
+            },
+        );
         // Same reading-column escape as markdown tables (#64): carve out a
         // scope wider than the prose allocation, anchored at the cursor.
         let mut table_scope_rect = ui.cursor();
@@ -2639,8 +3024,8 @@ impl CommonMarkViewerInternal {
                     .show(ui, |ui| {
                 ui.vertical(|ui| {
                     table_frame.show(ui, |ui| {
-                        let reset_column_widths =
-                            table_layout_bound_changed(ui, id, table_bound);
+                        let reset_column_widths = table_layout_bound_changed(ui, id, table_bound)
+                            || height_layout_changed;
                         let mut builder = egui_extras::TableBuilder::new(ui)
                             .id_salt(id.with("_wrapped"))
                             .striped(true)
@@ -3263,6 +3648,331 @@ mod tests {
 
         assert!((widths[0] - widths[1]).abs() < 0.01);
         assert!((widths[1] - widths[2]).abs() < 0.01);
+    }
+
+    #[test]
+    fn height_aware_columns_move_space_to_reduce_wrapping() {
+        let baseline = [150.0, 150.0];
+        let desired = [200.0, 500.0];
+        let widths = optimize_fitted_widths(
+            &baseline,
+            &desired,
+            &[40.0; 2],
+            2,
+            |column, width| {
+                let logical_lengths = if column == 0 {
+                    [40.0, 60.0]
+                } else {
+                    [500.0, 700.0]
+                };
+                logical_lengths
+                    .map(|length| (length / width).ceil() * 20.0)
+                    .to_vec()
+            },
+        );
+
+        assert!(widths[0] < baseline[0]);
+        assert!(widths[1] > baseline[1]);
+        assert!(
+            (widths.iter().sum::<f32>() - baseline.iter().sum::<f32>()).abs() < 0.01
+        );
+        assert!(widths[0] >= 40.0 && widths[1] <= desired[1]);
+    }
+
+    #[test]
+    fn height_aware_columns_check_each_eight_pixel_step() {
+        let baseline = [100.0, 100.0];
+        let widths = optimize_fitted_widths(
+            &baseline,
+            &[100.0, 200.0],
+            &[40.0, 40.0],
+            1,
+            |column, width| {
+                let height = if column == 0 {
+                    if width < 76.0 { 100.0 } else { 20.0 }
+                } else if width < 124.0 {
+                    100.0
+                } else {
+                    20.0
+                };
+                vec![height]
+            },
+        );
+
+        assert_eq!(widths, [76.0, 124.0]);
+    }
+
+    #[test]
+    fn height_aware_columns_bound_expensive_cell_measurements() {
+        let measured_cells = std::cell::Cell::new(0usize);
+        let row_count = 1_000;
+        let baseline = [100.0, 100.0];
+        let widths = optimize_fitted_widths(
+            &baseline,
+            &[200.0, 300.0],
+            &[40.0, 40.0],
+            row_count,
+            |_, _| {
+                measured_cells.set(measured_cells.get() + row_count);
+                vec![20.0; row_count]
+            },
+        );
+
+        assert_eq!(widths, baseline);
+        assert!(measured_cells.get() <= 4_096);
+    }
+
+    #[test]
+    fn height_aware_columns_are_deterministic_when_scores_tie() {
+        let baseline = [100.0, 100.0, 100.0];
+        let desired = [300.0, 300.0, 300.0];
+        let measure = |_: usize, _: f32| vec![20.0, 20.0];
+
+        let first = optimize_fitted_widths(&baseline, &desired, &[40.0; 3], 2, measure);
+        let second = optimize_fitted_widths(&baseline, &desired, &[40.0; 3], 2, measure);
+
+        assert_eq!(first, baseline);
+        assert_eq!(second, baseline);
+    }
+
+    #[test]
+    fn height_aware_columns_skip_measurement_when_no_transfer_is_possible() {
+        let compact = optimize_fitted_widths(
+            &[80.0, 120.0],
+            &[80.0, 120.0],
+            &[40.0, 40.0],
+            2,
+            |_, _| panic!("compact natural widths do not need height optimization"),
+        );
+        let all_at_minimum = optimize_fitted_widths(
+            &[60.0, 80.0],
+            &[200.0, 300.0],
+            &[60.0, 80.0],
+            2,
+            |_, _| panic!("columns at their floors cannot donate width"),
+        );
+
+        assert_eq!(compact, [80.0, 120.0]);
+        assert_eq!(all_at_minimum, [60.0, 80.0]);
+    }
+
+    #[test]
+    fn height_aware_columns_keep_baseline_without_a_row_height_reduction() {
+        let baseline = [100.0, 100.0];
+        let desired = [200.0, 200.0];
+        let minimums = [40.0, 40.0];
+        let widths = optimize_fitted_widths(
+            &baseline,
+            &desired,
+            &minimums,
+            1,
+            |column, width| {
+                if column == 0 {
+                    vec![if width >= 108.0 { 20.0 } else { 40.0 }]
+                } else {
+                    vec![100.0]
+                }
+            },
+        );
+
+        assert_eq!(widths, baseline);
+    }
+
+    #[test]
+    fn height_aware_columns_cross_one_flat_step_to_reduce_tied_row_maxima() {
+        let baseline = [100.0, 100.0, 100.0];
+        let desired = [200.0, 200.0, 100.0];
+        let minimums = [40.0, 40.0, 40.0];
+        let widths = optimize_fitted_widths(
+            &baseline,
+            &desired,
+            &minimums,
+            1,
+            |column, width| {
+                let height = match column {
+                    0 | 1 if width >= 108.0 => 20.0,
+                    0 | 1 => 100.0,
+                    _ => 20.0,
+                };
+                vec![height]
+            },
+        );
+
+        assert!(widths[0] >= 108.0);
+        assert!(widths[1] >= 108.0);
+        assert!(widths[2] <= 84.0);
+        assert!((widths.iter().sum::<f32>() - baseline.iter().sum::<f32>()).abs() < 0.01);
+    }
+
+    #[test]
+    fn height_aware_cache_invalidates_only_when_its_layout_key_changes() {
+        egui::__run_test_ui(|ui| {
+            let id = egui::Id::new("height-aware-cache");
+            let baseline = [100.0, 100.0];
+            let desired = [200.0, 300.0];
+            let minimums = [40.0, 40.0];
+            let measurements = std::cell::Cell::new(0);
+            let measure = |_: usize, _: f32| {
+                measurements.set(measurements.get() + 1);
+                vec![20.0]
+            };
+
+            let (_, first_changed) = cached_height_aware_widths(
+                ui, id, 1, &baseline, &desired, &minimums, 1, measure,
+            );
+            let after_first = measurements.get();
+            let (_, stable_changed) = cached_height_aware_widths(
+                ui, id, 1, &baseline, &desired, &minimums, 1, measure,
+            );
+            let after_stable = measurements.get();
+            let (_, new_key_changed) = cached_height_aware_widths(
+                ui, id, 2, &baseline, &desired, &minimums, 1, measure,
+            );
+
+            assert!(!first_changed);
+            assert!(!stable_changed);
+            assert!(new_key_changed);
+            assert!(after_first > 0);
+            assert_eq!(after_stable, after_first);
+            assert!(measurements.get() > after_stable);
+        });
+    }
+
+    #[test]
+    fn table_layout_key_tracks_measurement_inputs() {
+        egui::__run_test_ui(|ui| {
+            let desired = [100.0, 200.0];
+            let minimums = [40.0, 60.0];
+            let key = table_layout_key(ui, &desired, &minimums, 300.0, 20.0, 7, 0, 1.0);
+
+            assert_ne!(
+                key,
+                table_layout_key(ui, &desired, &[40.0, 61.0], 300.0, 20.0, 7, 0, 1.0)
+            );
+            assert_ne!(
+                key,
+                table_layout_key(ui, &desired, &minimums, 300.0, 20.0, 7, 1, 1.0)
+            );
+            assert_ne!(
+                key,
+                table_layout_key(ui, &desired, &minimums, 300.0, 20.0, 7, 0, 1.25)
+            );
+        });
+    }
+
+    #[test]
+    fn height_aware_columns_reduce_production_wrapped_row_height() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let mut style = ui.style().as_ref().clone();
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(16.0));
+            ui.set_style(style);
+            ui.set_width(360.0);
+            let cache = CommonMarkCache::default();
+            let options = CommonMarkOptions::default();
+            let line_height = body_line_height(ui, &options);
+            let rows = [
+                [
+                    vec![(Event::Text("field".into()), 0..5)],
+                    vec![(Event::Text(
+                        "A long requirement whose prose should receive enough width to avoid excessive wrapped lines."
+                            .into(),
+                    ), 0..91)],
+                ],
+                [
+                    vec![(Event::Code("limitations".into()), 0..11)],
+                    vec![(Event::Text(
+                        "Record missing data, sampling bias, execution failures, and other interpretation limits."
+                            .into(),
+                    ), 0..88)],
+                ],
+            ];
+            // Natural-width collection is covered separately. Use explicit
+            // demands here so this test remains about the production height
+            // measurement path even under egui's minimal test font setup.
+            let desired = vec![120.0, 700.0];
+            let minimums = [40.0; 2];
+            let baseline = fit_column_widths(&desired, 340.0, &minimums);
+            let measure = |column: usize, width: f32| {
+                rows.iter()
+                    .map(|row| {
+                        table_cell_height(
+                            &row[column],
+                            line_height,
+                            &cache,
+                            ui,
+                            width,
+                            &options,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let optimized = optimize_fitted_widths(
+                &baseline,
+                &desired,
+                &minimums,
+                rows.len(),
+                measure,
+            );
+
+            let mut before_cache = HashMap::new();
+            let before = table_height_score(
+                &baseline,
+                rows.len(),
+                &mut before_cache,
+                usize::MAX,
+                &mut |column, width| {
+                    rows.iter()
+                        .map(|row| {
+                            table_cell_height(
+                                &row[column],
+                                line_height,
+                                &cache,
+                                ui,
+                                width,
+                                &options,
+                            )
+                        })
+                        .collect()
+                },
+            )
+            .unwrap();
+            let mut after_cache = HashMap::new();
+            let after = table_height_score(
+                &optimized,
+                rows.len(),
+                &mut after_cache,
+                usize::MAX,
+                &mut |column, width| {
+                    rows.iter()
+                        .map(|row| {
+                            table_cell_height(
+                                &row[column],
+                                line_height,
+                                &cache,
+                                ui,
+                                width,
+                                &options,
+                            )
+                        })
+                        .collect()
+                },
+            )
+            .unwrap();
+
+            assert!(
+                after.row_max_total < before.row_max_total,
+                "desired={desired:?} baseline={baseline:?} optimized={optimized:?} before={before:?} after={after:?}"
+            );
+            assert!((optimized.iter().sum::<f32>() - baseline.iter().sum::<f32>()).abs() < 0.01);
+        });
+        let _ = ctx.end_pass();
     }
 
     #[test]
