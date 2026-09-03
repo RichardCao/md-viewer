@@ -1159,3 +1159,27 @@ Do not change renderer soft-break behavior to satisfy a fixture whose syntax exp
 - A backgrounded `Xvfb &` inherits stdout and holds the pipe open, so `script.sh | tail` hangs forever waiting for EOF. Redirect it.
 
 **Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs`, `crates/egui_commonmark/egui_commonmark_backend/src/pulldown.rs` (`ContentGeometry`), `crates/egui_commonmark/egui_commonmark/tests/wrapping.rs`, `crates/egui_commonmark/egui_commonmark/tests/slice_perf.rs`, `scripts/visual-regression.sh`, `docs/devlog/055-viewport-slice-layout.md`
+
+### A scroll-regression fixture only proves anything if the sampling is fine enough to land in the failure window
+**Context:** Issue #121 — scrolling the wrench `asset_reference.md` intermittently painted an empty document pane. Writing `scripts/scroll-regression.sh` to guard the fix.
+**What the guard has to catch:** a viewport slice that anchors outside the viewport and paints nothing, so scrolling appears to skip whole sections. `scripts/visual-regression.sh` does not catch it — on the broken build (main @ 7b8f53b) it reports PASS while four of sixty-one captured frames are blank.
+
+**Two false-confidence traps hit while building it, both of which produce a green test that checks nothing:**
+
+1. **The fixture was too short and too uniform.** A first fixture of five identical 40-row tables reached the document bottom at frame 13 and never went blank on the broken build. Matching the real document's shape — twenty tables from 4 to 51 rows, cell text of varying length so row heights differ, a nested index list at the top — pushed the bottom out to frame 31, comparable to the real document's 35.
+2. **Even the right fixture passed at the wrong granularity.** At 60 steps of 10 wheel clicks the fixture still reported PASS on the broken build. The blank states occupy narrow scroll windows, and coarse steps jump over them. At 150 steps of 3 clicks the same fixture and the same binary produce `FAIL: 1 frame(s) painted an empty document pane`. The real document was more forgiving (4 blanks at 60x10) purely because it has more and taller tables, so it offers more windows to land in.
+
+**Validation matrix — a scroll guard is not trustworthy until all four cells are confirmed:**
+
+| build | fixture 60x10 | fixture 150x3 | real doc 60x10 |
+|---|---|---|---|
+| broken (7b8f53b) | PASS (useless) | **FAIL** | **FAIL** (4 blanks) |
+| fixed (#113) | PASS | PASS | PASS |
+
+**The metric matters too.** `visual-regression.sh` keys off the leftmost painted pixel, which works on its own flush-left fixture but false-positives on any document with indented content — a nested list item legitimately starts further right, which reported a bogus 26px "shift" on `asset_reference.md`. The scroll guard keys off painted-content volume in the document pane plus frame-to-frame difference, which does not depend on document shape. Measure the document pane only (crop out explorer and outline): both side panels keep painting when the document pane goes blank, so a whole-window measurement hides exactly the failure being hunted.
+
+**Distinguishing "stuck" from "at the bottom":** a run of identical frames at the tail is the document bottom and is correct; the same run in the middle means scrolling stopped advancing. Find the tail run first, then only flag non-advancing frames before it.
+
+**What the finished guard immediately found:** with the fixture and granularity that survive the traps above, the post-#113 build still paints a blank pane at one scroll position (issue #125) — deterministic across three runs, and identical before and after #113, so a second independent path. Cutting the fixture to the four sections around that failure does *not* reproduce, which says the trigger is scroll depth rather than the local table boundary. Worth stating plainly: the guard is red on main today, and shipping it red is the point. A guard tuned until it passes is the #96 mistake in a new costume.
+
+**Files:** `scripts/scroll-regression.sh`, `docs/devlog/058-scroll-regression-guard.md`
