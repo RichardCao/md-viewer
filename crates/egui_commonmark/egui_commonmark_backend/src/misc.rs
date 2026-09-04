@@ -68,6 +68,11 @@ pub struct CommonMarkOptions<'f> {
     /// Opt into using the named strong font family. Callers must register
     /// `STRONG_FONT_FAMILY` in egui before enabling this to avoid lookup panics.
     pub use_strong_font_family: bool,
+    /// Opt into parsing a leading `---` block as YAML frontmatter and rendering
+    /// it as a key/value table. Off by default: enabling it changes how a
+    /// document that starts with `---` is *parsed*, not just painted, so it
+    /// must not silently alter existing consumers' output.
+    pub render_frontmatter: bool,
 }
 
 impl std::fmt::Debug for CommonMarkOptions<'_> {
@@ -93,6 +98,7 @@ impl std::fmt::Debug for CommonMarkOptions<'_> {
             .field("mutable", &self.mutable)
             .field("typography", &self.typography)
             .field("use_strong_font_family", &self.use_strong_font_family)
+            .field("render_frontmatter", &self.render_frontmatter)
             .finish()
     }
 }
@@ -117,6 +123,7 @@ impl Default for CommonMarkOptions<'_> {
             html_fn: None,
             typography: TypographyConfig::default(),
             use_strong_font_family: false,
+            render_frontmatter: false,
         }
     }
 }
