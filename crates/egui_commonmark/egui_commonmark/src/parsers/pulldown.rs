@@ -201,6 +201,90 @@ fn visit_highlight_segments<'a>(
 /// Blind char-count cut (not break-friendly on `/`, `-`, etc.): variable-length
 /// segments can still exceed the column at narrow widths and re-introduce the
 /// original clipping bug. Fixed-size chunks always fit.
+/// Split a YAML frontmatter block into top-level key/value pairs.
+///
+/// Deliberately not a YAML parser. VS Code renders frontmatter as a flat
+/// two-column table and does not descend into nested structures; matching that
+/// keeps a de-facto-standard block readable without taking on a YAML
+/// dependency and its error modes. Anything that is not a top-level
+/// `key: value` line — nested mappings, sequence items, folded scalars — is
+/// appended to the preceding value verbatim, so no source text is dropped.
+fn parse_frontmatter_pairs(raw: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // A continuation line is indented, or is a sequence item, or has no
+        // colon at all. Only an unindented `key:` starts a new row.
+        let is_continuation = line.starts_with(char::is_whitespace) || line.trim_start().starts_with('-');
+        let split = if is_continuation {
+            None
+        } else {
+            line.find(':')
+        };
+
+        match split {
+            Some(idx) => {
+                let key = line[..idx].trim().to_owned();
+                let value = line[idx + 1..].trim().to_owned();
+                pairs.push((key, value));
+            }
+            None => {
+                if let Some((_, value)) = pairs.last_mut() {
+                    if !value.is_empty() {
+                        value.push(' ');
+                    }
+                    value.push_str(line.trim());
+                } else {
+                    // Leading junk before any key: keep it visible rather than
+                    // silently dropping it.
+                    pairs.push((String::new(), line.trim().to_owned()));
+                }
+            }
+        }
+    }
+
+    pairs
+}
+
+/// Paint a frontmatter block as a two-column key/value table.
+fn render_frontmatter_table(
+    ui: &mut Ui,
+    raw: &str,
+    options: &CommonMarkOptions,
+    max_width: f32,
+) {
+    let pairs = parse_frontmatter_pairs(raw);
+    if pairs.is_empty() {
+        return;
+    }
+
+    let _ = options;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_max_width(max_width);
+        egui::Grid::new(ui.next_auto_id())
+            .num_columns(2)
+            .spacing(egui::vec2(ui.spacing().item_spacing.x, 4.0))
+            .striped(true)
+            .show(ui, |ui| {
+                for (key, value) in pairs {
+                    // The gap has to be produced *inside* the key cell: the
+                    // grid sizes column one to its widest entry, so a long key
+                    // otherwise ends flush against its value ("authorJane Doe").
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(key).strong());
+                        ui.add_space(12.0);
+                    });
+                    ui.label(value);
+                    ui.end_row();
+                }
+            });
+    });
+}
+
 fn inline_code_wrap_segments(text: &str) -> Vec<String> {
     const MAX_SEGMENT_CHARS: usize = 56;
 
@@ -529,6 +613,9 @@ pub struct CommonMarkViewerInternal {
     /// Nested table/list/blockquote UIs must not replace this origin when
     /// converting navigation positions into document coordinates.
     render_origin_y: f32,
+    /// Raw text of the frontmatter block being collected. `Some` only between
+    /// `Tag::MetadataBlock` and its end, so ordinary text is unaffected.
+    frontmatter: Option<String>,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -554,6 +641,7 @@ impl CommonMarkViewerInternal {
             is_table: false,
             is_blockquote: false,
             checkbox_events: Vec::new(),
+            frontmatter: None,
             current_heading_y: None,
             current_heading_source_start: None,
             current_heading_text: String::new(),
@@ -787,7 +875,7 @@ impl CommonMarkViewerInternal {
             // rewritten pre-parse on an in-memory copy and ranges are mapped
             // back, so they stay valid against the original text.
             let owned_events: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
-                super::latex_delimiters::parse_events(text, math_enabled);
+                super::latex_delimiters::parse_events(text, math_enabled, options.render_frontmatter);
             cache.set_cached_events(content_hash, owned_events);
         }
 
@@ -970,7 +1058,7 @@ impl CommonMarkViewerInternal {
                 // Must produce byte-identical events to the cache-fill parse
                 // above — including any LaTeX delimiter rewrite (#60) — or
                 // split_points index into an unrelated stream (see devlog 027).
-                sc.events = super::latex_delimiters::parse_events(text, math_enabled);
+                sc.events = super::latex_delimiters::parse_events(text, math_enabled, options.render_frontmatter);
                 sc.content_version = version;
                 // Content changed — cached split_points y-coords are no
                 // longer valid for this content. Drop them so the first
@@ -1558,7 +1646,13 @@ impl CommonMarkViewerInternal {
             }
             pulldown_cmark::Event::End(tag) => self.end_tag(ui, tag, cache, options, max_width),
             pulldown_cmark::Event::Text(text) => {
-                self.event_text_with_highlights(text, &src_span, cache, ui, options);
+                // Inside a frontmatter block the text is metadata, not prose:
+                // collect it and paint the whole block at TagEnd instead.
+                if let Some(buffer) = self.frontmatter.as_mut() {
+                    buffer.push_str(&text);
+                } else {
+                    self.event_text_with_highlights(text, &src_span, cache, ui, options);
+                }
             }
             pulldown_cmark::Event::Code(text) => {
                 // A bare local Markdown filename is often written as inline code.
@@ -2006,7 +2100,10 @@ impl CommonMarkViewerInternal {
             pulldown_cmark::Tag::HtmlBlock => {
                 self.line.try_insert_start(ui);
             }
-            pulldown_cmark::Tag::MetadataBlock(_) => {}
+            pulldown_cmark::Tag::MetadataBlock(_) => {
+                self.line.try_insert_start(ui);
+                self.frontmatter = Some(String::new());
+            }
 
             pulldown_cmark::Tag::DefinitionList => {
                 self.line.try_insert_start(ui);
@@ -2192,7 +2289,12 @@ impl CommonMarkViewerInternal {
                 }
             }
 
-            pulldown_cmark::TagEnd::MetadataBlock(_) => {}
+            pulldown_cmark::TagEnd::MetadataBlock(_) => {
+                if let Some(raw) = self.frontmatter.take() {
+                    render_frontmatter_table(ui, &raw, options, max_width);
+                    self.line.try_insert_end(ui);
+                }
+            }
 
             pulldown_cmark::TagEnd::DefinitionList => self.line.try_insert_end(ui),
             pulldown_cmark::TagEnd::DefinitionListTitle
@@ -2370,6 +2472,63 @@ impl CommonMarkViewerInternal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frontmatter_splits_top_level_key_value_pairs() {
+        let pairs = parse_frontmatter_pairs(
+            "title: My Document\nauthor: Jane Doe\ndate: 2026-08-30\n",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("title".to_owned(), "My Document".to_owned()),
+                ("author".to_owned(), "Jane Doe".to_owned()),
+                ("date".to_owned(), "2026-08-30".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn frontmatter_keeps_a_value_containing_a_colon_intact() {
+        // Only the *first* colon separates; a URL must not be truncated.
+        let pairs = parse_frontmatter_pairs("url: https://example.com/path?a=1\n");
+        assert_eq!(
+            pairs,
+            vec![("url".to_owned(), "https://example.com/path?a=1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn frontmatter_folds_nested_lines_into_the_preceding_value() {
+        // Not a YAML parser by design: nested mappings and sequence items are
+        // folded into the parent value rather than dropped or mis-split into
+        // their own rows.
+        let pairs = parse_frontmatter_pairs("nested:\n  key: value\nlist:\n  - first\n  - second\n");
+        assert_eq!(
+            pairs,
+            vec![
+                ("nested".to_owned(), "key: value".to_owned()),
+                ("list".to_owned(), "- first - second".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn frontmatter_ignores_blank_lines_and_survives_leading_junk() {
+        let pairs = parse_frontmatter_pairs("\n\nstray\n\ntitle: X\n");
+        assert_eq!(
+            pairs,
+            vec![
+                (String::new(), "stray".to_owned()),
+                ("title".to_owned(), "X".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn frontmatter_of_only_blank_lines_yields_nothing_to_paint() {
+        assert!(parse_frontmatter_pairs("\n   \n").is_empty());
+    }
+
     use super::*;
     use pulldown_cmark::{Event, Options, Parser, Tag};
 
@@ -2948,7 +3107,7 @@ mod tests {
         );
         let active_start = markdown.find("ACTIVE_TABLE_MATCH").unwrap();
         let active_range = active_start..active_start + "ACTIVE_TABLE_MATCH".len();
-        let heading_source_start = crate::parsers::latex_delimiters::parse_events(markdown, false)
+        let heading_source_start = crate::parsers::latex_delimiters::parse_events(markdown, false, false)
             .into_iter()
             .find_map(|(event, range)| {
                 matches!(event, Event::Start(Tag::Heading { .. })).then_some(range.start)

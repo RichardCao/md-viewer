@@ -275,6 +275,18 @@ impl<'f> CommonMarkViewer<'f> {
         self
     }
 
+    /// Parse a leading `---` block as YAML frontmatter and render it as a
+    /// key/value table instead of as document content.
+    ///
+    /// Off by default. This changes how the document is *parsed*, not only how
+    /// it is painted: with it off, `---` opens a thematic break and the
+    /// metadata lines become an ordinary paragraph. Enabling it by default
+    /// would therefore change existing consumers' output.
+    pub fn render_frontmatter(mut self, enabled: bool) -> Self {
+        self.options.render_frontmatter = enabled;
+        self
+    }
+
     /// Set line height as a multiplier of font size.
     ///
     /// Recommended value: 1.5 (per WCAG 2.1 SC 1.4.12)

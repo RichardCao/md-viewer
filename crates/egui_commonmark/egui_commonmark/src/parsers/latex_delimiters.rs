@@ -65,28 +65,38 @@ impl OffsetMap {
 /// `\(...\)` / `\[...\]` delimiters to `$...$` / `$$...$$` on an in-memory
 /// copy when paired occurrences exist in prose. Returned event ranges always
 /// refer to `text`, the original source.
-pub fn parse_events(text: &str, math_enabled: bool) -> Vec<(Event<'static>, Range<usize>)> {
+pub fn parse_events(
+    text: &str,
+    math_enabled: bool,
+    frontmatter_enabled: bool,
+) -> Vec<(Event<'static>, Range<usize>)> {
     if !math_enabled {
-        return parse_owned(text, false);
+        return parse_owned(text, false, frontmatter_enabled);
     }
     let rewrites = find_rewrites(text);
     if rewrites.is_empty() {
-        return parse_owned(text, true);
+        return parse_owned(text, true, frontmatter_enabled);
     }
     let (normalized, map) = build_normalized(text, &rewrites);
-    let mut events = parse_owned(&normalized, true);
+    let mut events = parse_owned(&normalized, true, frontmatter_enabled);
     for (_, range) in events.iter_mut() {
         map.map_range(range);
     }
     events
 }
 
-fn parse_owned(text: &str, math_enabled: bool) -> Vec<(Event<'static>, Range<usize>)> {
-    let options = if math_enabled {
-        parser_options() | Options::ENABLE_MATH
-    } else {
-        parser_options()
-    };
+fn parse_owned(
+    text: &str,
+    math_enabled: bool,
+    frontmatter_enabled: bool,
+) -> Vec<(Event<'static>, Range<usize>)> {
+    let mut options = parser_options();
+    if math_enabled {
+        options |= Options::ENABLE_MATH;
+    }
+    if frontmatter_enabled {
+        options |= Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+    }
     Parser::new_ext(text, options)
         .into_offset_iter()
         .map(|(event, range)| (event.into_static(), range))
@@ -291,7 +301,7 @@ mod tests {
 
     /// Collect (event-debug, original-slice) pairs.
     fn outline(text: &str) -> Vec<(String, String)> {
-        parse_events(text, true)
+        parse_events(text, true, false)
             .into_iter()
             .map(|(event, range)| (format!("{event:?}"), text[range].to_string()))
             .collect()
@@ -305,7 +315,7 @@ mod tests {
     }
 
     fn plain_texts(text: &str) -> Vec<String> {
-        parse_events(text, true)
+        parse_events(text, true, false)
             .into_iter()
             .filter(|(event, _)| matches!(event, Event::Text(_)))
             .map(|(event, _)| match event {
@@ -334,7 +344,7 @@ mod tests {
             r"| \(a_t/(D_t^{opp}+\epsilon)\) |",
             "\n",
         );
-        let formulas: Vec<_> = parse_events(text, true)
+        let formulas: Vec<_> = parse_events(text, true, false)
             .into_iter()
             .filter_map(|(event, range)| match event {
                 Event::InlineMath(tex) => Some((tex.into_string(), text[range].to_string())),
@@ -389,7 +399,7 @@ mod tests {
             r"| first | \(\operatorname{EW}[|\Delta OI|]\) | native |",
             "\n",
         );
-        let events = parse_events(text, true);
+        let events = parse_events(text, true, false);
 
         assert_eq!(
             events
@@ -484,7 +494,7 @@ mod tests {
     #[test]
     fn ranges_after_conversion_point_into_the_original() {
         let text = "a \\(x\\) b";
-        let events = parse_events(text, true);
+        let events = parse_events(text, true, false);
         let after = events
             .iter()
             .find(|(e, _)| matches!(e, Event::Text(t) if t.contains('b')))
@@ -501,14 +511,14 @@ mod tests {
     fn fast_path_when_nothing_converts() {
         // No LaTeX pairs: identical output to a direct parse.
         assert_eq!(
-            parse_events("plain $x$ text", true),
-            parse_owned("plain $x$ text", true)
+            parse_events("plain $x$ text", true, false),
+            parse_owned("plain $x$ text", true, false)
         );
     }
 
     #[test]
     fn math_disabled_leaves_everything_alone() {
-        let events = parse_events("\\(x\\)", false);
+        let events = parse_events("\\(x\\)", false, false);
         assert!(events.iter().all(|(e, _)| !matches!(
             e,
             Event::InlineMath(_) | Event::DisplayMath(_)

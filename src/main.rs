@@ -3385,6 +3385,10 @@ impl MarkdownApp {
                     .table_max_width(Some(content_width))
                     .indentation_spaces(2)
                     .use_strong_font_family(true)
+                    // Frontmatter is metadata, not prose: show it as a
+                    // key/value table rather than a thematic break plus a
+                    // paragraph of raw `key: value` lines (#117).
+                    .render_frontmatter(true)
                     .show_alt_text_on_hover(true)
                     .syntax_theme_dark("base16-ocean.dark")
                     .syntax_theme_light("base16-ocean.light")
