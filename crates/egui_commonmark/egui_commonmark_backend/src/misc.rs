@@ -2495,11 +2495,37 @@ impl CommonMarkCache {
 
     fn observe_image_size(&mut self, uri: &str, size: egui::Vec2) {
         match self.image_sizes.insert(uri.to_owned(), size) {
+            // A later size change invalidates measurements taken against the
+            // previous one.
             Some(previous) if (previous - size).length_sq() > 0.25 => {
+                self.mark_layout_changed();
+            }
+            // `HashMap::insert` returns `None` the first time a key is written.
+            // Images load asynchronously, so the first paint measured any row
+            // containing this image with no size available; that measurement is
+            // now stale and has to be redone. Without this arm the row keeps the
+            // height it was given before the image existed (#124).
+            None => {
                 self.mark_layout_changed();
             }
             _ => {}
         }
+    }
+
+    /// Seed an observed image size without painting. Test-only: production
+    /// code must go through the paint path so `layout_revision` is maintained.
+    #[doc(hidden)]
+    pub fn observe_image_size_for_test(&mut self, uri: &str, size: egui::Vec2) {
+        self.observe_image_size(uri, size);
+    }
+
+    /// Size of an image as last painted, if it has been painted at least once.
+    ///
+    /// Returns `None` before the first paint of that URI — callers must fall
+    /// back rather than assume zero, or a row will collapse on the frame before
+    /// the image loads.
+    pub fn observed_image_size(&self, uri: &str) -> Option<egui::Vec2> {
+        self.image_sizes.get(uri).copied()
     }
 
     /// Read-only view of stored search ranges (used by the renderer).
