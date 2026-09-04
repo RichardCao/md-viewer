@@ -19,6 +19,7 @@ A fast, lightweight markdown viewer for Linux built with Rust and egui. Designed
 - **Mermaid Diagrams** - Flowcharts, sequence diagrams, and more rendered natively via [merman](https://github.com/Latias94/merman) (click to enlarge)
 - **Resizable Table Columns** - Drag column dividers to fit content (new in v0.1.5)
 - **HTML Tables** - Rendered as formatted grids with proper cell padding
+- **YAML Frontmatter** - A leading `---` block renders as a key/value table instead of raw text
 - **Images & SVG** - Embedded and remote image support (PNG, JPEG, GIF, SVG, HTTP URLs)
 - **Unicode Support** - System font fallbacks (Noto, DejaVu) for emojis, CJK, and non-Latin scripts
 - **60 FPS Rendering** - Viewport virtualization keeps scroll smooth on 100k+ line docs
@@ -37,6 +38,8 @@ A fast, lightweight markdown viewer for Linux built with Rust and egui. Designed
 ### View
 - **Dark & Light Themes** - Toggle with Ctrl+D
 - **Zoom** - 50% to 300% zoom (Ctrl++/-/0 or Ctrl+Scroll)
+- **Full Width** - Toggle between the reading-width column and the full content pane; prose and tables follow it together
+- **Formula Size** - Scale rendered math from 100% to 150% (View → Formula Size), independent of UI zoom
 - **Keyboard Scrolling** - Scroll documents with ↑/↓ by line or Page Up/Page Down by page when the find bar is closed
 - **Live Reload** - Auto-refresh on file changes (enabled by default)
 - **Custom Colors** - Customize highlight and link text colors (View → Colors…)
