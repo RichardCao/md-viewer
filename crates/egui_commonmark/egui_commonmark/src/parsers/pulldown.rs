@@ -13,6 +13,7 @@ use egui_commonmark_backend_extended::elements::{
 use egui_commonmark_backend_extended::misc::*;
 use egui_commonmark_backend_extended::pulldown::*;
 use pulldown_cmark::{CowStr, HeadingLevel};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Search-match highlight kind for a single rendered text segment.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -412,6 +413,18 @@ fn natural_text_width(ui: &Ui, text: &str) -> f32 {
         + 16.0
 }
 
+/// Width needed to keep the widest Unicode word on one line.
+///
+/// Body content may wrap aggressively, but a short table header such as
+/// `Required` should not be forced into `Require` / `d`. Unicode word
+/// boundaries keep CJK headers breakable while treating shaped scripts and
+/// combining sequences as words rather than splitting scalar values.
+fn unbreakable_text_width(ui: &Ui, text: &str) -> f32 {
+    text.unicode_words()
+        .map(|word| natural_text_width(ui, word))
+        .fold(40.0, f32::max)
+}
+
 fn wrapped_text_height(ui: &Ui, text: &str, column_width: f32, line_height: f32) -> f32 {
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     let galley = ui.painter().layout(
@@ -423,33 +436,76 @@ fn wrapped_text_height(ui: &Ui, text: &str, column_width: f32, line_height: f32)
     line_height * 1.5 * galley.rows.len().max(1) as f32
 }
 
-/// Preserve naturally narrow columns while sharing the remaining width among
-/// wider columns. If even the minimum widths do not fit, horizontal scrolling
+/// Blend max-min fairness with proportional content demand while fitting the
+/// available width. The fair component prevents one outlier from starving its
+/// neighbors; the proportional component preserves meaningful differences
+/// between wider columns. If hard minimums do not fit, horizontal scrolling
 /// remains available.
-fn fit_column_widths(desired: &[f32], available: f32, minimum: f32) -> Vec<f32> {
+fn fit_column_widths(desired: &[f32], available: f32, minimums: &[f32]) -> Vec<f32> {
     if desired.is_empty() {
         return Vec::new();
     }
-    let desired: Vec<f32> = desired.iter().map(|width| width.max(minimum)).collect();
-    if desired.iter().sum::<f32>() <= available {
-        return desired;
+    assert_eq!(desired.len(), minimums.len());
+    let minimums: Vec<f64> = minimums
+        .iter()
+        .map(|width| width.max(40.0) as f64)
+        .collect();
+    let desired: Vec<f64> = desired
+        .iter()
+        .zip(&minimums)
+        .map(|(width, minimum)| (*width as f64).max(*minimum))
+        .collect();
+    let available = available as f64;
+    let desired_total = desired.iter().sum::<f64>();
+    if desired_total <= available {
+        return desired.into_iter().map(|width| width as f32).collect();
     }
-    if available <= minimum * desired.len() as f32 {
-        return vec![minimum; desired.len()];
+    let minimum_total = minimums.iter().sum::<f64>();
+    if available <= minimum_total {
+        return minimums.into_iter().map(|width| width as f32).collect();
     }
 
-    let mut low = minimum;
-    let mut high = desired.iter().copied().fold(minimum, f32::max);
-    for _ in 0..24 {
-        let cap = (low + high) * 0.5;
-        let total: f32 = desired.iter().map(|width| width.min(cap)).sum();
-        if total > available {
-            high = cap;
+    // Reserve every header floor first, then distribute the remaining space
+    // fairly across each column's unmet demand. With equal floors this is the
+    // original max-min water filling translated by that common floor.
+    let headrooms: Vec<f64> = desired
+        .iter()
+        .zip(&minimums)
+        .map(|(wanted, minimum)| wanted - minimum)
+        .collect();
+    let surplus = available - minimum_total;
+    let mut sorted = headrooms.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mut remaining = surplus;
+    let mut active = sorted.len();
+    let mut fair_cap = 0.0;
+    for wanted in sorted {
+        let equal_share = remaining / active as f64;
+        if wanted <= equal_share {
+            remaining -= wanted;
+            active -= 1;
+            fair_cap = wanted;
         } else {
-            low = cap;
+            fair_cap = equal_share;
+            break;
         }
     }
-    desired.into_iter().map(|width| width.min(low)).collect()
+
+    // Proportional allocation above the hard minimum is continuous and keeps
+    // meaningful differences in unmet demand. Blend mostly toward fairness so
+    // a very large outlier cannot dominate.
+    const FAIR_WEIGHT: f64 = 0.6;
+    let proportional_scale = surplus / (desired_total - minimum_total);
+
+    minimums
+        .into_iter()
+        .zip(headrooms)
+        .map(|(minimum, headroom)| {
+            let fair = minimum + headroom.min(fair_cap);
+            let proportional = minimum + proportional_scale * headroom;
+            (FAIR_WEIGHT * fair + (1.0 - FAIR_WEIGHT) * proportional) as f32
+        })
+        .collect()
 }
 
 /// Fit columns inside the table's outer width contract.
@@ -457,13 +513,17 @@ fn fit_column_widths(desired: &[f32], available: f32, minimum: f32) -> Vec<f32> 
 /// The group frame contributes padding and a stroke on both sides. Those are
 /// part of the table's visible width, so only the remaining space belongs to
 /// columns and their separators.
-fn framed_table_widths(ui: &Ui, desired: &[f32], table_bound: f32) -> (egui::Frame, Vec<f32>) {
+fn framed_table_widths(
+    ui: &Ui,
+    desired: &[f32],
+    minimums: &[f32],
+    table_bound: f32,
+) -> (egui::Frame, Vec<f32>) {
     let frame = egui::Frame::group(ui.style());
-    let column_space =
-        ui.spacing().item_spacing.x * desired.len().saturating_sub(1) as f32;
+    let column_space = ui.spacing().item_spacing.x * desired.len().saturating_sub(1) as f32;
     let frame_width = frame.total_margin().sum().x;
     let column_budget = (table_bound - frame_width - column_space).max(0.0);
-    let widths = fit_column_widths(desired, column_budget, 40.0);
+    let widths = fit_column_widths(desired, column_budget, minimums);
     (frame, widths)
 }
 
@@ -1520,6 +1580,14 @@ impl CommonMarkViewerInternal {
                 .table_max_width
                 .map(|w| w as f32)
                 .unwrap_or(max_width);
+            let minimum_widths: Vec<f32> = (0..num_cols)
+                .map(|column| {
+                    header
+                        .get(column)
+                        .map(|cell| unbreakable_text_width(ui, &markdown_cell_text(cell)))
+                        .unwrap_or(40.0)
+                })
+                .collect();
             let mut table_rows = Vec::with_capacity(rows.len() + usize::from(!header.is_empty()));
             if !header.is_empty() {
                 table_rows.push(header);
@@ -1535,7 +1603,7 @@ impl CommonMarkViewerInternal {
                 })
                 .collect();
             let (table_frame, initial_widths) =
-                framed_table_widths(ui, &desired_widths, table_bound);
+                framed_table_widths(ui, &desired_widths, &minimum_widths, table_bound);
             // The document ui is allocated at the prose width, and a child ui
             // can never exceed its parent's allocation — so a wider viewport
             // must be carved out explicitly. egui does not clamp an explicit
@@ -1607,12 +1675,12 @@ impl CommonMarkViewerInternal {
                                         .auto_shrink([true, true])
                                         .min_scrolled_height(0.0)
                                         .cell_layout(egui::Layout::left_to_right(egui::Align::Min));
-                                    for width in initial_widths {
+                                    for (column, width) in initial_widths.into_iter().enumerate() {
                                         builder = builder.column(
                                             egui_extras::Column::initial(width)
                                                 .resizable(true)
                                                 .clip(true)
-                                                .at_least(40.0),
+                                                .at_least(minimum_widths[column]),
                                         );
                                     }
                                     if reset_column_widths {
@@ -2420,6 +2488,16 @@ impl CommonMarkViewerInternal {
             .map(|row| (true, row.as_slice()))
             .chain(table.rows.iter().map(|row| (false, row.as_slice())))
             .collect();
+        let minimum_widths: Vec<f32> = (0..num_cols)
+            .map(|column| {
+                table
+                    .header
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .map(|cell| unbreakable_text_width(ui, cell))
+                    .fold(40.0, f32::max)
+            })
+            .collect();
         let desired_widths: Vec<f32> = (0..num_cols)
             .map(|column| {
                 table_rows
@@ -2430,7 +2508,7 @@ impl CommonMarkViewerInternal {
             })
             .collect();
         let (table_frame, initial_widths) =
-            framed_table_widths(ui, &desired_widths, table_bound);
+            framed_table_widths(ui, &desired_widths, &minimum_widths, table_bound);
         // Same reading-column escape as markdown tables (#64): carve out a
         // scope wider than the prose allocation, anchored at the cursor.
         let mut table_scope_rect = ui.cursor();
@@ -2457,12 +2535,12 @@ impl CommonMarkViewerInternal {
                             .auto_shrink([true, true])
                             .min_scrolled_height(0.0)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Min));
-                        for width in initial_widths {
+                        for (column, width) in initial_widths.into_iter().enumerate() {
                             builder = builder.column(
                                 egui_extras::Column::initial(width)
                                     .resizable(true)
                                     .clip(true)
-                                    .at_least(40.0),
+                                    .at_least(minimum_widths[column]),
                             );
                         }
 
@@ -2726,7 +2804,8 @@ mod tests {
         egui::__run_test_ui(|ui| {
             let table_bound = 360.0;
             let desired = [400.0, 500.0, 600.0];
-            let (frame, widths) = framed_table_widths(ui, &desired, table_bound);
+            let (frame, widths) =
+                framed_table_widths(ui, &desired, &[40.0; 3], table_bound);
             let column_space =
                 ui.spacing().item_spacing.x * desired.len().saturating_sub(1) as f32;
             let visible_width =
@@ -2789,20 +2868,139 @@ mod tests {
     }
 
     #[test]
-    fn fitted_table_columns_preserve_narrow_content() {
-        let widths = fit_column_widths(&[60.0, 500.0, 120.0], 360.0, 40.0);
-        assert!((widths[0] - 60.0).abs() < 0.1);
-        assert!((widths[2] - 120.0).abs() < 0.1);
+    fn fitted_table_columns_balance_fairness_and_content_demand() {
+        let widths = fit_column_widths(&[60.0, 500.0, 120.0], 360.0, &[40.0; 3]);
+
         assert!((widths.iter().sum::<f32>() - 360.0).abs() < 0.1);
-        assert!(widths[1] > widths[2]);
+        assert!(widths[1] > widths[2] && widths[2] > widths[0]);
+        assert!(widths.iter().all(|width| *width >= 40.0));
     }
 
     #[test]
     fn fitted_table_columns_keep_minimum_for_horizontal_overflow() {
         assert_eq!(
-            fit_column_widths(&[100.0, 200.0, 300.0], 100.0, 40.0),
+            fit_column_widths(&[100.0, 200.0, 300.0], 100.0, &[40.0; 3]),
             vec![40.0; 3]
         );
+    }
+
+    #[test]
+    fn fitted_table_columns_respect_individual_header_floors() {
+        let minimums = [40.0, 72.0, 88.0];
+        let widths = fit_column_widths(&[100.0, 300.0, 240.0], 300.0, &minimums);
+
+        assert!((widths.iter().sum::<f32>() - 300.0).abs() < 0.1);
+        assert!(
+            widths
+                .iter()
+                .zip(minimums)
+                .all(|(width, minimum)| *width >= minimum)
+        );
+    }
+
+    #[test]
+    fn header_floors_overflow_instead_of_splitting_words() {
+        let minimums = [40.0, 92.0, 96.0];
+
+        assert_eq!(
+            fit_column_widths(&[100.0, 300.0, 240.0], 180.0, &minimums),
+            minimums
+        );
+    }
+
+    #[test]
+    fn header_floor_uses_the_widest_unicode_word() {
+        egui::__run_test_ui(|ui| {
+            let required = unbreakable_text_width(ui, "Required");
+            let allowed_types = unbreakable_text_width(ui, "Allowed Types");
+
+            assert_eq!(required, natural_text_width(ui, "Required").max(40.0));
+            assert_eq!(
+                allowed_types,
+                natural_text_width(ui, "Allowed")
+                    .max(natural_text_width(ui, "Types"))
+                    .max(40.0)
+            );
+        });
+    }
+
+    #[test]
+    fn fitted_table_columns_leave_compact_tables_at_natural_width() {
+        assert_eq!(
+            fit_column_widths(&[60.0, 80.0, 120.0], 360.0, &[40.0; 3]),
+            vec![60.0, 80.0, 120.0]
+        );
+    }
+
+    #[test]
+    fn fitted_table_columns_normalize_demands_below_the_minimum() {
+        let widths = fit_column_widths(&[10.0, 100.0], 120.0, &[40.0; 2]);
+
+        assert!((widths.iter().sum::<f32>() - 120.0).abs() < 0.1);
+        assert!(widths[0] >= 40.0 && widths[1] >= 40.0);
+        assert!(widths[1] > widths[0]);
+    }
+
+    #[test]
+    fn fitted_table_columns_weight_space_by_unmet_width() {
+        let widths = fit_column_widths(&[200.0, 400.0, 300.0], 600.0, &[40.0; 3]);
+
+        assert!((widths.iter().sum::<f32>() - 600.0).abs() < 0.1);
+        assert!(widths[1] > widths[2] && widths[2] > widths[0]);
+    }
+
+    #[test]
+    fn fitted_table_columns_are_continuous_across_equal_share() {
+        let below = fit_column_widths(&[200.0, 400.0, 300.0], 599.9, &[40.0; 3]);
+        let above = fit_column_widths(&[200.0, 400.0, 300.0], 600.1, &[40.0; 3]);
+
+        assert!(
+            below
+                .iter()
+                .zip(above)
+                .all(|(left, right)| (left - right).abs() < 0.2),
+            "column widths jumped across a 0.2 px resize: {below:?}"
+        );
+    }
+
+    #[test]
+    fn fitted_table_columns_keep_outlier_neighbors_ordered() {
+        let desired = [60.0, 70.0, 10_000.0];
+        let widths = fit_column_widths(&desired, 200.0, &[40.0; 3]);
+
+        assert!((widths.iter().sum::<f32>() - 200.0).abs() < 0.1);
+        assert!(widths[2] > widths[1] && widths[1] > widths[0]);
+        assert!(
+            widths
+                .iter()
+                .zip(desired)
+                .all(|(width, wanted)| *width >= 40.0 && *width <= wanted)
+        );
+    }
+
+    #[test]
+    fn fitted_table_columns_keep_total_with_extreme_outlier() {
+        let desired = [60.0, 70.0, 1.0e10];
+        let widths = fit_column_widths(&desired, 200.0, &[40.0; 3]);
+
+        assert!((widths.iter().sum::<f32>() - 200.0).abs() < 0.1);
+        assert!(widths[2] > widths[1] && widths[1] > widths[0]);
+    }
+
+    #[test]
+    fn fitted_table_columns_handle_a_single_column() {
+        assert_eq!(
+            fit_column_widths(&[500.0], 200.0, &[40.0]),
+            vec![200.0]
+        );
+    }
+
+    #[test]
+    fn fitted_table_columns_keep_equal_demands_equal() {
+        let widths = fit_column_widths(&[300.0, 300.0, 300.0], 600.0, &[40.0; 3]);
+
+        assert!((widths[0] - widths[1]).abs() < 0.01);
+        assert!((widths[1] - widths[2]).abs() < 0.01);
     }
 
     #[test]

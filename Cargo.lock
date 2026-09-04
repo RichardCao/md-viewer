@@ -1491,6 +1491,7 @@ dependencies = [
  "emojis",
  "pulldown-cmark 0.13.4",
  "resvg",
+ "unicode-segmentation",
 ]
 
 [[package]]

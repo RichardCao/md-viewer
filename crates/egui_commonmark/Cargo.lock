@@ -1170,6 +1170,7 @@ dependencies = [
  "image",
  "pulldown-cmark 0.13.0",
  "resvg",
+ "unicode-segmentation",
 ]
 
 [[package]]
