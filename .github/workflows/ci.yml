@@ -79,6 +79,7 @@ jobs:
       - name: Test renderer crates
         run: |
           cargo test --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_extended --features "$RENDERER_FEATURES"
+          cargo test --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_backend_extended --no-default-features
           cargo test --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_backend_extended --all-features
           cargo test --manifest-path crates/egui_commonmark/Cargo.toml -p egui_commonmark_macros_extended
 

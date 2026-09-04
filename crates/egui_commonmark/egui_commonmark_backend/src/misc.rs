@@ -452,6 +452,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "math")]
     #[test]
     fn math_cache_key_includes_the_point_size() {
         // Without this, the first rendered size is served for every later
@@ -461,6 +462,7 @@ mod tests {
         assert_ne!(at(16.0), at(16.5));
     }
 
+    #[cfg(feature = "math")]
     #[test]
     fn math_cache_key_absorbs_sub_hundredth_size_jitter() {
         // The size derives from a resolved font height, which fluctuates in the
