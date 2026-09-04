@@ -334,11 +334,33 @@ fn table_cell_height(
     cache: &CommonMarkCache,
     ui: &Ui,
     column_width: f32,
+    options: &CommonMarkOptions,
 ) -> f32 {
     let text = markdown_cell_text(cell);
     let mut height = wrapped_text_height(ui, &text, column_width, line_height)
         .max(line_height * 1.5 * cell_visual_lines(cell) as f32);
     for (event, _) in cell {
+        // Images contribute their painted height. The URI has to be resolved
+        // exactly the way the painting path does it (`Image::new` applies the
+        // scheme rules), otherwise the cache lookup misses and the row silently
+        // stays text-height.
+        if let pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { dest_url, .. }) = event {
+            let uri = crate::Image::new(dest_url, options).uri;
+            let image_height = match cache.observed_image_size(&uri) {
+                // Painted at least once: the width is already capped by the
+                // cell, so the recorded height is what the row needs.
+                Some(size) if size.y > 0.0 => size.y,
+                // Not yet loaded. Reserving nothing collapses the row and the
+                // image is clipped on every frame until it loads; reserving a
+                // full cell width of height over-reserves for a wide thin
+                // image. A square-ish guess bounded by the column keeps the
+                // first frame usable, and `observe_image_size` marks the layout
+                // dirty once the real size arrives so this is re-measured.
+                _ => column_width.min(line_height * 8.0),
+            };
+            height = height.max(image_height);
+        }
+
         if let pulldown_cmark::Event::InlineMath(_tex) = event {
             let conservative = line_height * 2.0;
             #[cfg(feature = "math")]
@@ -1576,6 +1598,7 @@ impl CommonMarkViewerInternal {
                                                                     .get(column)
                                                                     .copied()
                                                                     .unwrap_or(40.0),
+                                                                options,
                                                             )
                                                         })
                                                         .fold(cell_h, f32::max)
@@ -2590,11 +2613,71 @@ mod tests {
     fn table_cells_reserve_extra_height_for_inline_math() {
         egui::__run_test_ui(|ui| {
             let cache = CommonMarkCache::default();
+            let options = CommonMarkOptions::default();
             let line_height = ui.text_style_height(&egui::TextStyle::Body);
             let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
 
             assert!(
-                table_cell_height(&cell, line_height, &cache, ui, 120.0) >= line_height * 2.0
+                table_cell_height(&cell, line_height, &cache, ui, 120.0, &options)
+                    >= line_height * 2.0
+            );
+        });
+    }
+
+    #[test]
+    fn table_cell_reserves_height_for_an_image_of_known_size() {
+        // The size an image was last painted at is what its row must reserve.
+        egui::__run_test_ui(|ui| {
+            let mut cache = CommonMarkCache::default();
+            let options = CommonMarkOptions::default();
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+
+            let cell = vec![(
+                Event::Start(Tag::Image {
+                    link_type: pulldown_cmark::LinkType::Inline,
+                    dest_url: "chart.png".into(),
+                    title: "".into(),
+                    id: "".into(),
+                }),
+                0..10,
+            )];
+
+            let without = table_cell_height(&cell, line_height, &cache, ui, 120.0, &options);
+
+            let uri = crate::Image::new("chart.png", &options).uri;
+            cache.observe_image_size_for_test(&uri, egui::vec2(120.0, 400.0));
+            let with = table_cell_height(&cell, line_height, &cache, ui, 120.0, &options);
+
+            assert!(
+                with >= 400.0,
+                "row must reserve the painted image height, got {with}"
+            );
+            assert!(
+                with > without,
+                "a known image size must not shrink the reservation ({with} vs {without})"
+            );
+        });
+    }
+
+    #[test]
+    fn a_cached_image_size_does_not_leak_into_text_only_cells() {
+        // Guards the blast radius: seeding a known image size must change the
+        // height of cells that contain that image and nothing else.
+        egui::__run_test_ui(|ui| {
+            let mut cache = CommonMarkCache::default();
+            let options = CommonMarkOptions::default();
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+            let cell = vec![(Event::Text("plain".into()), 0..5)];
+
+            let before = table_cell_height(&cell, line_height, &cache, ui, 120.0, &options);
+
+            let uri = crate::Image::new("chart.png", &options).uri;
+            cache.observe_image_size_for_test(&uri, egui::vec2(120.0, 400.0));
+            let after = table_cell_height(&cell, line_height, &cache, ui, 120.0, &options);
+
+            assert_eq!(
+                before, after,
+                "a text-only cell must not change when some image's size becomes known"
             );
         });
     }
