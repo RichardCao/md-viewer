@@ -39,6 +39,7 @@ A fast, lightweight markdown viewer for Linux built with Rust and egui. Designed
 - **Zoom** - 50% to 300% zoom (Ctrl++/-/0 or Ctrl+Scroll)
 - **Keyboard Scrolling** - Scroll documents with ↑/↓ by line or Page Up/Page Down by page when the find bar is closed
 - **Live Reload** - Auto-refresh on file changes (enabled by default)
+- **Custom Colors** - Customize highlight and link text colors (View → Colors…)
 
 ### Usability
 - **Drag and Drop** - Drop markdown files onto the window to open
