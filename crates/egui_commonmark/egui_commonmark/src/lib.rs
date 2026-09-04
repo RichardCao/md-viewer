@@ -287,6 +287,20 @@ impl<'f> CommonMarkViewer<'f> {
         self
     }
 
+    /// Size of rendered formulas as a multiple of the resolved Body font size.
+    ///
+    /// `1.0` (the default) renders math at the same point size as body text.
+    /// Math glyphs and dense fractions read as perceptually smaller than prose
+    /// at equal point size, so a value slightly above 1.0 is often more
+    /// legible. Application zoom is not a substitute — it scales the whole UI,
+    /// leaving formulas and their surrounding text in the same ratio.
+    ///
+    /// Values are clamped to at least 1pt.
+    pub fn math_scale(mut self, scale: f32) -> Self {
+        self.options.math_scale = scale;
+        self
+    }
+
     /// Set line height as a multiplier of font size.
     ///
     /// Recommended value: 1.5 (per WCAG 2.1 SC 1.4.12)

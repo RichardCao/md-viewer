@@ -364,12 +364,12 @@ fn table_cell_height(
         if let pulldown_cmark::Event::InlineMath(_tex) = event {
             let conservative = line_height * 2.0;
             #[cfg(feature = "math")]
-            let formula_height = crate::cached_inline_math_height(ui, cache, _tex)
+            let formula_height = crate::cached_inline_math_height(ui, cache, _tex, options)
                 .map(|exact| exact + line_height * 0.5)
                 .unwrap_or(conservative);
             #[cfg(not(feature = "math"))]
             let formula_height = {
-                let _ = (cache, ui);
+                let _ = (cache, ui, options);
                 conservative
             };
             height = height.max(formula_height);
@@ -702,6 +702,9 @@ fn compute_layout_signature(ui: &egui::Ui, options: &CommonMarkOptions) -> u64 {
     // Caller-configured constraints that affect block widths.
     options.default_width.hash(&mut h);
     options.indentation_spaces.hash(&mut h);
+    // Formula size changes rendered formula extents, so split_points measured
+    // at the old scale are stale. Quantized like the heights above.
+    ((options.math_scale * 100.0).round() as i32).hash(&mut h);
     h.finish()
 }
 
@@ -1776,9 +1779,9 @@ impl CommonMarkViewerInternal {
                     #[cfg(feature = "math")]
                     {
                         if self.is_table {
-                            crate::render_math_in_table(ui, cache, &tex);
+                            crate::render_math_in_table(ui, cache, &tex, options);
                         } else {
-                            crate::render_math(ui, cache, &tex, true);
+                            crate::render_math(ui, cache, &tex, true, options);
                         }
                     }
                     #[cfg(not(feature = "math"))]
@@ -1796,7 +1799,7 @@ impl CommonMarkViewerInternal {
                 newline(ui);
                 #[cfg(feature = "math")]
                 {
-                    crate::render_math(ui, cache, &tex, false);
+                    crate::render_math(ui, cache, &tex, false, options);
                 }
                 #[cfg(not(feature = "math"))]
                 if let Some(math_fn) = options.math_fn {

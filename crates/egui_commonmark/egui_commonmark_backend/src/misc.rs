@@ -73,6 +73,14 @@ pub struct CommonMarkOptions<'f> {
     /// document that starts with `---` is *parsed*, not just painted, so it
     /// must not silently alter existing consumers' output.
     pub render_frontmatter: bool,
+    /// Size of rendered formulas, as a multiple of the resolved Body font size.
+    ///
+    /// `1.0` renders math at the same point size as body text. Math glyphs and
+    /// dense fractions read as perceptually smaller than prose at equal point
+    /// size, so a value slightly above 1.0 is often more legible. Application
+    /// zoom is not a substitute: it scales the whole UI, leaving the formula
+    /// and its surrounding text in the same ratio.
+    pub math_scale: f32,
 }
 
 impl std::fmt::Debug for CommonMarkOptions<'_> {
@@ -99,6 +107,7 @@ impl std::fmt::Debug for CommonMarkOptions<'_> {
             .field("typography", &self.typography)
             .field("use_strong_font_family", &self.use_strong_font_family)
             .field("render_frontmatter", &self.render_frontmatter)
+            .field("math_scale", &self.math_scale)
             .finish()
     }
 }
@@ -124,6 +133,7 @@ impl Default for CommonMarkOptions<'_> {
             typography: TypographyConfig::default(),
             use_strong_font_family: false,
             render_frontmatter: false,
+            math_scale: 1.0,
         }
     }
 }
@@ -401,6 +411,7 @@ mod tests {
                 false,
                 egui::Color32::BLACK,
                 egui::Color32::WHITE,
+                16.0,
             )
             .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
 
@@ -417,6 +428,7 @@ mod tests {
             false,
             egui::Color32::BLACK,
             egui::Color32::WHITE,
+            16.0,
         );
         assert_ne!(
             base,
@@ -425,6 +437,7 @@ mod tests {
                 false,
                 egui::Color32::DARK_GRAY,
                 egui::Color32::WHITE,
+                16.0,
             )
         );
         assert_ne!(
@@ -434,8 +447,27 @@ mod tests {
                 false,
                 egui::Color32::BLACK,
                 egui::Color32::LIGHT_GRAY,
+                16.0,
             )
         );
+    }
+
+    #[test]
+    fn math_cache_key_includes_the_point_size() {
+        // Without this, the first rendered size is served for every later
+        // scale and changing the setting appears to do nothing.
+        let at = |pt| math_cache_hash("x + y", true, egui::Color32::BLACK, egui::Color32::WHITE, pt);
+        assert_ne!(at(16.0), at(20.0));
+        assert_ne!(at(16.0), at(16.5));
+    }
+
+    #[test]
+    fn math_cache_key_absorbs_sub_hundredth_size_jitter() {
+        // The size derives from a resolved font height, which fluctuates in the
+        // last float digits between frames. Re-keying on that would recompile
+        // every formula through typst on every paint.
+        let at = |pt| math_cache_hash("x + y", true, egui::Color32::BLACK, egui::Color32::WHITE, pt);
+        assert_eq!(at(16.0), at(16.0001));
     }
 
     #[cfg(feature = "math")]
@@ -452,6 +484,7 @@ mod tests {
                     is_inline: true,
                     fg: egui::Color32::BLACK,
                     bg: egui::Color32::WHITE,
+                    size_pt: 16.0,
                     result_tx,
                 },
             ),
@@ -477,6 +510,7 @@ mod tests {
                 is_inline: true,
                 fg: egui::Color32::BLACK,
                 bg: egui::Color32::WHITE,
+                size_pt: 16.0,
                 result_tx,
             }
         };
@@ -507,6 +541,7 @@ mod tests {
                 true,
                 egui::Color32::BLACK,
                 egui::Color32::WHITE,
+                16.0,
             )
             .unwrap()
             .image
@@ -528,6 +563,7 @@ mod tests {
             true,
             egui::Color32::WHITE,
             bg,
+            16.0,
         )
         .unwrap();
         let [width, height] = rendered.image.size;
@@ -1327,6 +1363,9 @@ struct MathJob {
     is_inline: bool,
     fg: egui::Color32,
     bg: egui::Color32,
+    /// Resolved point size. Travels with the job because the worker thread has
+    /// no `Ui` to ask, and must match the size that produced `hash`.
+    size_pt: f32,
     result_tx: mpsc::Sender<MathRenderResult>,
 }
 
@@ -1354,7 +1393,8 @@ fn start_math_workers(worker_count: usize, queue_capacity: usize) -> mpsc::SyncS
                     },
                     Err(_) => break,
                 };
-                let result = render_math_formula(&job.latex, job.is_inline, job.fg, job.bg);
+                let result =
+                    render_math_formula(&job.latex, job.is_inline, job.fg, job.bg, job.size_pt);
                 let _ = job.result_tx.send(MathRenderResult {
                     hash: job.hash,
                     result,
@@ -1574,6 +1614,7 @@ fn render_math_formula(
     is_inline: bool,
     fg: egui::Color32,
     bg: egui::Color32,
+    size_pt: f32,
 ) -> Result<MathRendered, String> {
     // 0. Decode common HTML entities that OCR/conversion tools may leave in math
     let latex = latex
@@ -1611,10 +1652,11 @@ fn render_math_formula(
     let source = format!(
         r#"{preamble}
 #set page(width: auto, height: auto, margin: 0pt, fill: none)
-#set text(size: 16pt, fill: black)
+#set text(size: {size_pt}pt, fill: black)
 {equation}"#,
         preamble = MITEX_PREAMBLE,
         equation = equation,
+        size_pt = size_pt,
     );
 
     // 3. Compile with typst. Reuse the embedded fonts (see MATH_FONTS) instead
@@ -1715,9 +1757,17 @@ pub fn cached_inline_math_height(
     ui: &egui::Ui,
     cache: &CommonMarkCache,
     latex: &str,
+    options: &CommonMarkOptions,
 ) -> Option<f32> {
-    // Key must match what the render pipeline stores (exact colors, like #92).
-    let hash = math_cache_hash(latex, true, ui.visuals().text_color(), ui.visuals().panel_fill);
+    // Key must match what the render pipeline stores (exact colors, like #92,
+    // and the same point size — see `math_size_pt`).
+    let hash = math_cache_hash(
+        latex,
+        true,
+        ui.visuals().text_color(),
+        ui.visuals().panel_fill,
+        math_size_pt(ui, options),
+    );
     match cache.math_states.get(&hash) {
         Some(MathState::Ready { size, .. }) => Some(size.y),
         _ => None,
@@ -1732,14 +1782,20 @@ pub fn render_math(
     cache: &mut CommonMarkCache,
     latex: &str,
     is_inline: bool,
+    options: &CommonMarkOptions,
 ) {
-    render_math_with_layout(ui, cache, latex, is_inline, true);
+    render_math_with_layout(ui, cache, latex, is_inline, true, options);
 }
 
 /// Render inline math in a vertically centered fixed-height table cell.
 #[cfg(feature = "math")]
-pub fn render_math_in_table(ui: &mut egui::Ui, cache: &mut CommonMarkCache, latex: &str) {
-    render_math_with_layout(ui, cache, latex, true, false);
+pub fn render_math_in_table(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    latex: &str,
+    options: &CommonMarkOptions,
+) {
+    render_math_with_layout(ui, cache, latex, true, false, options);
 }
 
 #[cfg(feature = "math")]
@@ -1749,11 +1805,13 @@ fn render_math_with_layout(
     latex: &str,
     is_inline: bool,
     align_to_text_baseline: bool,
+    options: &CommonMarkOptions,
 ) {
     let bg = ui.visuals().panel_fill;
     let fg = ui.visuals().text_color();
+    let size_pt = math_size_pt(ui, options);
 
-    let hash = math_cache_hash(latex, is_inline, fg, bg);
+    let hash = math_cache_hash(latex, is_inline, fg, bg, size_pt);
 
     // Poll for completed background renders
     let mut received_any = false;
@@ -1800,7 +1858,9 @@ fn render_math_with_layout(
         && !cache.math_rendering.contains(&hash)
         && cache.math_rendering.len() < math_concurrency()
     {
-        if spawn_math_render(hash, latex, is_inline, fg, bg, cache) == MathEnqueueStatus::Full {
+        if spawn_math_render(hash, latex, is_inline, fg, bg, size_pt, cache)
+            == MathEnqueueStatus::Full
+        {
             // The shared queue is bounded. Retry promptly after workers have
             // had a chance to drain it instead of silently waiting for an
             // unrelated UI event to revisit this formula.
@@ -1924,13 +1984,34 @@ fn math_cache_hash(
     is_inline: bool,
     fg: egui::Color32,
     bg: egui::Color32,
+    size_pt: f32,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     latex.hash(&mut hasher);
     is_inline.hash(&mut hasher);
     fg.hash(&mut hasher);
     bg.hash(&mut hasher);
+    // Quantized to 0.01 pt: the rendered bitmap differs at any size the eye can
+    // tell apart, but per-frame float resolution of the body height must not
+    // spawn a fresh typst compile every paint.
+    ((size_pt * 100.0).round() as i64).hash(&mut hasher);
     hasher.finish()
+}
+
+/// Point size to render formulas at, given the ui's Body style and the
+/// configured scale.
+///
+/// Kept in one place because the render path and the height-lookup path
+/// compute the cache key independently — if they disagree by so much as a
+/// rounding step, the lookup misses a key that was just stored.
+pub fn math_size_pt(ui: &egui::Ui, options: &CommonMarkOptions) -> f32 {
+    let body = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .map(|f| f.size)
+        .unwrap_or(16.0);
+    (body * options.math_scale).max(1.0)
 }
 
 #[cfg(feature = "math")]
@@ -1940,6 +2021,7 @@ fn spawn_math_render(
     is_inline: bool,
     fg: egui::Color32,
     bg: egui::Color32,
+    size_pt: f32,
     cache: &mut CommonMarkCache,
 ) -> MathEnqueueStatus {
     let job = MathJob {
@@ -1947,6 +2029,7 @@ fn spawn_math_render(
         latex: latex.to_owned(),
         is_inline,
         fg,
+        size_pt,
         bg,
         result_tx: cache.math_tx.clone(),
     };

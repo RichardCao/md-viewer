@@ -375,6 +375,7 @@ struct PersistedState {
     zoom_level: Option<f32>,
     show_outline: Option<bool>,
     full_width_content: Option<bool>,
+    math_scale: Option<f32>,
     /// Selection/highlight background color override, stored as premultiplied
     /// RGBA bytes (`Color32`'s canonical representation — see `Color32::r/g/b/a`
     /// and `Color32::from_rgba_premultiplied`). `None` = current theme default.
@@ -1759,6 +1760,7 @@ struct MarkdownApp {
     zoom_level: f32,
     show_outline: bool,
     full_width_content: bool,
+    math_scale: f32,
     // Selection/highlight background color override. `None` = theme default.
     highlight_color: Option<egui::Color32>,
     // Mirrors `last_applied_dark_mode`: only rebuild Visuals when this changes.
@@ -1868,6 +1870,7 @@ impl MarkdownApp {
         let zoom_level = persisted.zoom_level.unwrap_or(1.0).clamp(0.5, 3.0);
         let show_outline = persisted.show_outline.unwrap_or(true);
         let full_width_content = persisted.full_width_content.unwrap_or(false);
+        let math_scale = persisted.math_scale.unwrap_or(1.0).clamp(1.0, 2.0);
         let highlight_color = persisted
             .highlight_color
             .map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(r, g, b, a));
@@ -1965,6 +1968,7 @@ impl MarkdownApp {
             zoom_level,
             show_outline,
             full_width_content,
+            math_scale,
             // Frame 1 always rebuilds Visuals anyway (last_applied_dark_mode
             // starts at None), so this just avoids a spurious second rebuild
             // afterward if nothing further changes.
@@ -3390,6 +3394,7 @@ impl MarkdownApp {
                     // key/value table rather than a thematic break plus a
                     // paragraph of raw `key: value` lines (#117).
                     .render_frontmatter(true)
+                    .math_scale(self.math_scale)
                     .show_alt_text_on_hover(true)
                     .syntax_theme_dark("base16-ocean.dark")
                     .syntax_theme_light("base16-ocean.light")
@@ -4219,6 +4224,7 @@ impl eframe::App for MarkdownApp {
             zoom_level: Some(self.zoom_level),
             show_outline: Some(self.show_outline),
             full_width_content: Some(self.full_width_content),
+            math_scale: Some(self.math_scale),
             highlight_color: self.highlight_color.map(|c| [c.r(), c.g(), c.b(), c.a()]),
             link_color: self.link_color.map(|c| [c.r(), c.g(), c.b(), c.a()]),
             open_tabs: Some(self.get_open_tab_paths()),
@@ -4824,6 +4830,38 @@ impl eframe::App for MarkdownApp {
                         self.zoom_level = 1.0;
                         ui.close();
                     }
+
+                    ui.separator();
+                    // Distinct from zoom: zoom scales the whole UI, leaving
+                    // formulas and prose in the same ratio. This changes only
+                    // the formulas, relative to the text around them.
+                    ui.menu_button("Formula Size", |ui| {
+                        for (label, scale) in [
+                            ("100%", 1.0f32),
+                            ("110%", 1.1),
+                            ("125%", 1.25),
+                            ("150%", 1.5),
+                        ] {
+                            let selected = (self.math_scale - scale).abs() < 0.001;
+                            let text = if selected {
+                                format!("✓ {label}")
+                            } else {
+                                format!("   {label}")
+                            };
+                            let btn = ui.add(egui::Button::new(text));
+                            #[cfg(feature = "mcp")]
+                            self.mcp_bridge.register_widget(
+                                &format!("Menu: View → Formula Size → {label}"),
+                                "button",
+                                &btn,
+                                Some(if selected { "selected" } else { "unselected" }),
+                            );
+                            if btn.clicked() {
+                                self.math_scale = scale;
+                                ui.close();
+                            }
+                        }
+                    });
                 });
                 #[cfg(feature = "mcp")]
                 self.mcp_bridge
