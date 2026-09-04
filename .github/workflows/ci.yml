@@ -90,6 +90,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check app/renderer workspace dependency contract
+        run: bash scripts/check-workspace-sync.sh
       - name: Check versions match
         run: |
           # Robust extraction tolerating quotes and spacing
