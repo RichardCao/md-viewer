@@ -1545,7 +1545,43 @@ impl CommonMarkViewerInternal {
             // top of everything above it.
             let mut table_scope_rect = ui.cursor();
             table_scope_rect.max.x = table_scope_rect.min.x + table_bound;
-            table_scope_rect.max.y = ui.max_rect().bottom();
+            // Reserve the table's own height rather than "everything below the
+            // cursor".
+            //
+            // egui_extras accounts for the rows it skips only once its loop
+            // reaches the first *visible* row (`heterogeneous_rows` ->
+            // `add_buffer`). A table lying entirely above the visible range
+            // never gets there and reserves nothing, collapsing to zero height.
+            // Every block below it then lays out too high, so a paint made
+            // while scrolled measures the document shorter — and any position
+            // recorded during such a paint (heading y for outline clicks) is
+            // compressed by the same factor.
+            let reserved_row_heights: Vec<f32> = table_rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(column, cell)| {
+                            table_cell_height(
+                                cell,
+                                line_h,
+                                cache,
+                                ui,
+                                initial_widths.get(column).copied().unwrap_or(40.0),
+                                options,
+                            )
+                        })
+                        .fold(cell_h, f32::max)
+                })
+                .collect();
+            let group_frame = egui::Frame::group(ui.style());
+            let reserved_height = reserved_row_heights.iter().sum::<f32>()
+                + ui.spacing().item_spacing.y
+                    * reserved_row_heights.len().saturating_sub(1) as f32
+                + f32::from(group_frame.inner_margin.top)
+                + f32::from(group_frame.inner_margin.bottom)
+                + group_frame.stroke.width * 2.0;
+            table_scope_rect.max.y = table_scope_rect.min.y + reserved_height;
             let _ = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(table_scope_rect), |ui| {
                     let mut scroll_out = egui::ScrollArea::horizontal()
