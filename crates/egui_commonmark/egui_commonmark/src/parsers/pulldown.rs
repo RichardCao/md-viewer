@@ -311,22 +311,92 @@ fn inline_code_wrap_segments(text: &str) -> Vec<String> {
     segments
 }
 
-/// Count the visual lines a markdown table cell will occupy when rendered.
-/// Used by the `fn table` renderer to compute heterogeneous row heights so
-/// long inline-code paths (chunked by `inline_code_wrap_segments`) don't get
-/// clipped by a fixed row height. Only `Event::Code` chunking adds visual
-/// lines today; other inline events flow on a single line within a cell.
-fn cell_visual_lines(cell: &[(pulldown_cmark::Event, Range<usize>)]) -> usize {
-    let mut max_lines = 1usize;
+/// Measure a table cell's visible labels in their rendering order. The cell
+/// uses a wrapping horizontal layout: every label continues the current row,
+/// then uses the full column width for subsequent rows. Long code chunks call
+/// `ui.end_row()` in production, so they also finish a measurement row here.
+fn cell_visual_lines(
+    cell: &[(pulldown_cmark::Event, Range<usize>)],
+    ui: &Ui,
+    column_width: f32,
+) -> usize {
+    // `RichText::code().size(selected_font_size)` renders code with the body
+    // size and monospace family, not with the (usually smaller) Monospace text
+    // style. Keep measurement on that exact font-size path.
+    let body_font = egui::TextStyle::Body.resolve(ui.style());
+    let code_font = egui::FontId::new(body_font.size, egui::FontFamily::Monospace);
+    let wrap_width = (column_width - 8.0).max(1.0);
+    let item_spacing = ui.spacing().item_spacing.x;
+    let mut remaining_width = wrap_width;
+    let mut completed_lines = 0usize;
+    let measure_label = |text: &str, font_id: &egui::FontId, used_width: f32| {
+        let mut job = egui::text::LayoutJob::simple(
+            text.to_owned(),
+            font_id.clone(),
+            egui::Color32::WHITE,
+            wrap_width,
+        );
+        if let Some(first_section) = job.sections.first_mut() {
+            first_section.leading_space = used_width;
+        }
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    };
+
+    let add_label = |text: &str,
+                     font_id: &egui::FontId,
+                     remaining_width: &mut f32,
+                     completed_lines: &mut usize| {
+        let used_width = wrap_width - *remaining_width;
+        let galley = measure_label(text, font_id, used_width);
+        *completed_lines += galley.rows.len().saturating_sub(1);
+        let last_row_width = galley
+            .rows
+            .last()
+            .map_or(0.0, |row| row.rect().width())
+            .min(wrap_width);
+        *remaining_width = (wrap_width - last_row_width - item_spacing).max(0.0);
+    };
+
     for (event, _) in cell {
-        if let pulldown_cmark::Event::Code(text) = event {
-            let chunks = inline_code_wrap_segments(text).len();
-            if chunks > max_lines {
-                max_lines = chunks;
+        match event {
+            pulldown_cmark::Event::Text(text)
+            | pulldown_cmark::Event::InlineHtml(text)
+            | pulldown_cmark::Event::Html(text)
+            | pulldown_cmark::Event::FootnoteReference(text) => {
+                add_label(text, &body_font, &mut remaining_width, &mut completed_lines);
             }
+            pulldown_cmark::Event::Code(code) => {
+                let segments = inline_code_wrap_segments(code);
+                let force_rows = segments.len() > 1;
+                for segment in segments {
+                    add_label(
+                        &segment,
+                        &code_font,
+                        &mut remaining_width,
+                        &mut completed_lines,
+                    );
+                    if force_rows {
+                        completed_lines += 1;
+                        remaining_width = wrap_width;
+                    }
+                }
+            }
+            pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak => {
+                add_label(" ", &body_font, &mut remaining_width, &mut completed_lines);
+            }
+            pulldown_cmark::Event::TaskListMarker(checked) => {
+                add_label(
+                    if *checked { "[x] " } else { "[ ] " },
+                    &body_font,
+                    &mut remaining_width,
+                    &mut completed_lines,
+                );
+            }
+            _ => {}
         }
     }
-    max_lines
+
+    (completed_lines + usize::from(remaining_width < wrap_width)).max(1)
 }
 
 fn table_cell_height(
@@ -338,8 +408,23 @@ fn table_cell_height(
     options: &CommonMarkOptions,
 ) -> f32 {
     let text = markdown_cell_text(cell);
-    let mut height = wrapped_text_height(ui, &text, column_width, line_height)
-        .max(line_height * 1.5 * cell_visual_lines(cell) as f32);
+    let mut height = wrapped_text_height(ui, &text, column_width, line_height).max(
+        line_height * cell_visual_lines(cell, ui, column_width) as f32
+            + ui.spacing().item_spacing.y,
+    );
+    let has_visible_text = cell.iter().any(|(event, _)| {
+        matches!(
+            event,
+            pulldown_cmark::Event::Text(_)
+                | pulldown_cmark::Event::Code(_)
+                | pulldown_cmark::Event::InlineHtml(_)
+                | pulldown_cmark::Event::Html(_)
+                | pulldown_cmark::Event::FootnoteReference(_)
+                | pulldown_cmark::Event::TaskListMarker(_)
+        )
+    });
+    let mut inline_math_height = 0.0;
+    let mut inline_math_count = 0usize;
     for (event, _) in cell {
         // Images contribute their painted height. The URI has to be resolved
         // exactly the way the painting path does it (`Image::new` applies the
@@ -373,8 +458,19 @@ fn table_cell_height(
                 let _ = (cache, ui, options);
                 conservative
             };
-            height = height.max(formula_height);
+            inline_math_height += formula_height;
+            inline_math_count += 1;
         }
+    }
+    if inline_math_count == 1 && !has_visible_text {
+        height = height.max(inline_math_height);
+    } else if inline_math_count > 0 {
+        // Formula widgets participate in the same horizontal wrapping flow as
+        // labels. Without cached formula widths we cannot know whether each
+        // formula shares a row, so reserve their heights cumulatively whenever
+        // other visible content (or another formula) can force a row break.
+        height += inline_math_height
+            + (ui.spacing().item_spacing.y + 1.0) * inline_math_count as f32;
     }
     height
 }
@@ -433,7 +529,20 @@ fn wrapped_text_height(ui: &Ui, text: &str, column_width: f32, line_height: f32)
         egui::Color32::WHITE,
         (column_width - 8.0).max(1.0),
     );
-    line_height * 1.5 * galley.rows.len().max(1) as f32
+    line_height * galley.rows.len().max(1) as f32
+}
+
+fn body_line_height(ui: &Ui, options: &CommonMarkOptions) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let natural = ui
+        .text_style_height(&egui::TextStyle::Body)
+        .max(font.size);
+    options
+        .typography
+        .resolve_line_height(font.size)
+        // A configured line box can be smaller than the glyphs, but a fixed
+        // table row must still reserve their natural painted height.
+        .map_or(natural, |configured| configured.max(natural))
 }
 
 /// Blend max-min fairness with proportional content demand while fitting the
@@ -1552,7 +1661,7 @@ impl CommonMarkViewerInternal {
             } else {
                 rows.first().map(|r| r.len()).unwrap_or(0)
             };
-            let line_h = ui.text_style_height(&egui::TextStyle::Body);
+            let line_h = body_line_height(ui, options);
 
             if num_cols == 0 {
                 self.is_table = false;
@@ -1562,7 +1671,7 @@ impl CommonMarkViewerInternal {
                 self.line.try_insert_end(ui);
                 return;
             }
-            let cell_h = line_h * 1.5;
+            let cell_h = line_h + ui.spacing().item_spacing.y;
             // Outer ScrollArea::horizontal handles the case where columns
             // (auto-sized to content) total wider than the parent ui; without it,
             // narrow windows clip the rightmost columns. Plain vertical wheel
@@ -1720,27 +1829,34 @@ impl CommonMarkViewerInternal {
                                                             Some(egui::TextWrapMode::Wrap);
                                                         let col_w = ui.max_rect().width();
                                                         ui.set_width(col_w);
-                                                        for (e, src_span) in col {
-                                                            let tmp_start = std::mem::replace(
-                                                                &mut self.line.should_start_newline,
-                                                                false,
-                                                            );
-                                                            let tmp_end = std::mem::replace(
-                                                                &mut self.line.should_end_newline,
-                                                                false,
-                                                            );
-                                                            self.event(
-                                                                ui,
-                                                                e.clone(),
-                                                                src_span.clone(),
-                                                                cache,
-                                                                options,
-                                                                col_w,
-                                                            );
-                                                            self.line.should_start_newline =
-                                                                tmp_start;
-                                                            self.line.should_end_newline = tmp_end;
-                                                        }
+                                                        // Isolate the wrapping cursor from the
+                                                        // preallocated TableBuilder row height.
+                                                        // Otherwise egui uses that entire height as
+                                                        // the first text line's minimum height and
+                                                        // later inline widgets overflow the row.
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            for (e, src_span) in col {
+                                                                let tmp_start = std::mem::replace(
+                                                                    &mut self.line.should_start_newline,
+                                                                    false,
+                                                                );
+                                                                let tmp_end = std::mem::replace(
+                                                                    &mut self.line.should_end_newline,
+                                                                    false,
+                                                                );
+                                                                self.event(
+                                                                    ui,
+                                                                    e.clone(),
+                                                                    src_span.clone(),
+                                                                    cache,
+                                                                    options,
+                                                                    col_w,
+                                                                );
+                                                                self.line.should_start_newline =
+                                                                    tmp_start;
+                                                                self.line.should_end_newline = tmp_end;
+                                                            }
+                                                        });
                                                     });
                                                 }
                                         });
@@ -2465,8 +2581,8 @@ impl CommonMarkViewerInternal {
             .map(|r| r.len())
             .unwrap_or(0);
 
-        let line_h = ui.text_style_height(&egui::TextStyle::Body);
-        let cell_h = line_h * 1.5;
+        let line_h = body_line_height(ui, options);
+        let cell_h = line_h + ui.spacing().item_spacing.y;
 
         if num_cols == 0 {
             self.line.try_insert_end(ui);
@@ -2724,6 +2840,152 @@ mod tests {
             }
         }
         visible
+    }
+
+    #[test]
+    fn table_cells_measure_inline_code_with_the_monospace_font() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let mut style = ui.style().as_ref().clone();
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
+            ui.set_style(style);
+            let cache = CommonMarkCache::default();
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+            let code = "iiiiiiiiiiiiiiiiiiiiiiii";
+            let body_font = egui::TextStyle::Body.resolve(ui.style());
+            let mono_font = egui::FontId::new(body_font.size, egui::FontFamily::Monospace);
+            let body_width = ui
+                .painter()
+                .layout_no_wrap(code.to_owned(), body_font, egui::Color32::WHITE)
+                .size()
+                .x;
+            let mono_width = ui
+                .painter()
+                .layout_no_wrap(code.to_owned(), mono_font, egui::Color32::WHITE)
+                .size()
+                .x;
+            assert!(
+                mono_width > body_width,
+                "expected monospace code to be wider: body={body_width} mono={mono_width}"
+            );
+
+            // `wrapped_text_height` subtracts 8 px before layout. Choose a
+            // width where Body still fits but the rendered monospace code
+            // must wrap, exposing the old one-line row-height estimate.
+            let column_width = (body_width + mono_width) * 0.5 + 8.0;
+            let cell = vec![(Event::Code(code.into()), 0..code.len())];
+            let options = CommonMarkOptions::default();
+
+            let height =
+                table_cell_height(&cell, line_height, &cache, ui, column_width, &options);
+            assert!(height >= line_height * 2.0);
+            assert!(
+                height < line_height * 3.0,
+                "two visual lines should not reserve a third: {height}"
+            );
+        });
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn table_body_line_height_respects_typography_configuration() {
+        use egui_commonmark_backend_extended::typography::Measurement;
+
+        egui::__run_test_ui(|ui| {
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let natural = ui
+                .text_style_height(&egui::TextStyle::Body)
+                .max(font.size);
+            let mut options = CommonMarkOptions::default();
+
+            assert!((body_line_height(ui, &options) - natural).abs() < 0.01);
+
+            options.typography.line_height = Some(Measurement::Multiplier(1.5));
+            assert!((body_line_height(ui, &options) - font.size * 1.5).abs() < 0.01);
+
+            options.typography.line_height = Some(Measurement::Pixels(27.0));
+            assert!((body_line_height(ui, &options) - 27.0).abs() < 0.01);
+
+            options.typography.line_height = Some(Measurement::Pixels(1.0));
+            let clamped = body_line_height(ui, &options);
+            assert!(
+                (clamped - natural).abs() < 0.01,
+                "configured={clamped} natural={natural}"
+            );
+        });
+    }
+
+    #[test]
+    fn table_cells_accumulate_rows_from_multiple_chunked_code_events() {
+        egui::__run_test_ui(|ui| {
+            let first = "a".repeat(60);
+            let second = "b".repeat(60);
+            let cell = vec![
+                (Event::Code(first.into()), 0..60),
+                (Event::Text(" between ".into()), 60..69),
+                (Event::Code(second.into()), 69..129),
+            ];
+
+            assert_eq!(cell_visual_lines(&cell, ui, 2_000.0), 4);
+        });
+    }
+
+    #[test]
+    fn table_cells_measure_short_code_with_the_width_left_by_text() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            let mut style = ui.style().as_ref().clone();
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
+            ui.set_style(style);
+            let plain = "iiiiiiiiiiii";
+            let code = "iiiiiiiiiiii";
+            let body_font = egui::TextStyle::Body.resolve(ui.style());
+            let code_font = egui::FontId::new(body_font.size, egui::FontFamily::Monospace);
+            let plain_width = ui
+                .painter()
+                .layout_no_wrap(plain.to_owned(), body_font.clone(), egui::Color32::WHITE)
+                .size()
+                .x;
+            let code_as_body_width = ui
+                .painter()
+                .layout_no_wrap(code.to_owned(), body_font, egui::Color32::WHITE)
+                .size()
+                .x;
+            let code_width = ui
+                .painter()
+                .layout_no_wrap(code.to_owned(), code_font, egui::Color32::WHITE)
+                .size()
+                .x;
+            assert!(
+                code_width > code_as_body_width,
+                "expected code to be wider: body={code_as_body_width} code={code_width}"
+            );
+
+            // Body-only estimation fits, and either run fits alone, but the
+            // real mixed-font line does not.
+            let body_total = plain_width + code_as_body_width;
+            let mixed_total = plain_width + code_width;
+            let column_width = (body_total + mixed_total) * 0.5 + 8.0;
+            let cell = vec![
+                (Event::Text(plain.into()), 0..plain.len()),
+                (Event::Code(code.into()), plain.len()..plain.len() + code.len()),
+            ];
+
+            assert_eq!(cell_visual_lines(&cell, ui, column_width), 2);
+        });
+        let _ = ctx.end_pass();
     }
 
     #[test]

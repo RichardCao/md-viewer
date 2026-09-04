@@ -11,16 +11,18 @@ struct PaintedText {
     text: String,
     rect: Rect,
     rows: usize,
+    clip_rect: Rect,
     underlined: bool,
 }
 
-fn collect_painted_text(shape: &Shape, painted: &mut Vec<PaintedText>) {
+fn collect_painted_text(shape: &Shape, clip_rect: Rect, painted: &mut Vec<PaintedText>) {
     // Text can be emitted directly or nested in a grouped Shape::Vec.
     match shape {
         Shape::Text(text) => painted.push(PaintedText {
             text: text.galley.job.text.clone(),
             rect: text.galley.rect.translate(text.pos.to_vec2()),
             rows: text.galley.rows.len(),
+            clip_rect,
             underlined: text
                 .galley
                 .job
@@ -30,7 +32,7 @@ fn collect_painted_text(shape: &Shape, painted: &mut Vec<PaintedText>) {
         }),
         Shape::Vec(shapes) => {
             for shape in shapes {
-                collect_painted_text(shape, painted);
+                collect_painted_text(shape, clip_rect, painted);
             }
         }
         _ => {}
@@ -78,6 +80,7 @@ fn render_geometry_with_body_size(
             let response = CommonMarkViewer::new()
                 .default_width(Some(width as usize))
                 .table_max_width(Some(width as usize))
+                .line_height(1.5)
                 .show(ui, &mut cache, markdown);
             body_rect = response.response.rect;
         });
@@ -86,7 +89,7 @@ fn render_geometry_with_body_size(
         // Only final-pass positions represent the settled layout.
         if pass == 1 {
             for clipped in output.shapes {
-                collect_painted_text(&clipped.shape, &mut painted);
+                collect_painted_text(&clipped.shape, clipped.clip_rect, &mut painted);
             }
         }
     }
@@ -123,6 +126,21 @@ fn text_rect(painted: &[PaintedText], marker: &str) -> Rect {
         .find(|entry| entry.text.contains(marker))
         .unwrap_or_else(|| panic!("missing painted marker {marker:?}: {painted:#?}"))
         .rect
+}
+
+fn assert_text_fully_visible(painted: &[PaintedText], marker: &str) {
+    let entry = painted
+        .iter()
+        .find(|entry| entry.text.contains(marker))
+        .unwrap_or_else(|| panic!("missing painted marker {marker:?}: {painted:#?}"));
+    let tolerance = 0.5;
+    assert!(
+        entry.rect.left() >= entry.clip_rect.left() - tolerance
+            && entry.rect.right() <= entry.clip_rect.right() + tolerance
+            && entry.rect.top() >= entry.clip_rect.top() - tolerance
+            && entry.rect.bottom() <= entry.clip_rect.bottom() + tolerance,
+        "marker {marker:?} is clipped: entry={entry:?}"
+    );
 }
 
 fn assert_vertical_order(painted: &[PaintedText], markers: &[&str]) {
@@ -231,7 +249,7 @@ fn table_cell_height_after_widths(markdown: &str, widths: &[f32], marker: &str) 
             if pass == 1 {
                 let mut painted = Vec::new();
                 for clipped in output.shapes {
-                    collect_painted_text(&clipped.shape, &mut painted);
+                    collect_painted_text(&clipped.shape, clipped.clip_rect, &mut painted);
                 }
                 heights.push(text_rect(&painted, marker).height());
             }
@@ -265,6 +283,76 @@ fn html_table_reflows_after_panel_width_changes() {
 
     assert!(heights[1] < heights[0], "table did not widen: {heights:?}");
     assert!(heights[2] > heights[1], "table did not narrow: {heights:?}");
+}
+
+#[test]
+fn markdown_table_wraps_multiple_links_inside_their_cell() {
+    let markdown = "\
+| Signal | Reports |
+|---|---|
+| selected | [REPORT_IF](https://example.test/if) / [REPORT_IH](https://example.test/ih) / [REPORT_IC](https://example.test/ic) / [REPORT_IM](https://example.test/im) |
+
+AFTER_LINK_TABLE";
+    let (_, _, painted) = render_geometry(markdown, 280.0);
+
+    for marker in ["REPORT_IF", "REPORT_IH", "REPORT_IC", "REPORT_IM"] {
+        assert_text_fully_visible(&painted, marker);
+    }
+    let link_tops: std::collections::BTreeSet<_> = painted
+        .iter()
+        .filter(|entry| entry.underlined && entry.text.starts_with("REPORT_"))
+        .map(|entry| entry.rect.top().round() as i32)
+        .collect();
+    assert!(link_tops.len() > 1, "links did not wrap: {painted:#?}");
+    assert_vertical_order(&painted, &["REPORT_IM", "AFTER_LINK_TABLE"]);
+}
+
+#[test]
+fn markdown_table_wraps_mixed_prose_and_inline_code_without_clipping() {
+    let markdown = "\
+| Field | Requirement |
+|---|---|
+| `raw_formula` | 实际研究的原始公式；不得只保存名称、摘要或 `hash`；仅 `formula_status=unclear` 时可为空，并须说明缺失原因 |
+
+AFTER_MIXED_TABLE";
+    let (_, _, painted) = render_geometry(markdown, 320.0);
+
+    for marker in ["raw_formula", "hash", "formula_status=unclear"] {
+        assert_text_fully_visible(&painted, marker);
+    }
+    assert_vertical_order(&painted, &["formula_status=unclear", "AFTER_MIXED_TABLE"]);
+}
+
+#[test]
+fn selected_family_style_table_has_no_vertically_clipped_text() {
+    let table = "\
+| a | b | c | d | e | f | g | h | i | j | k | l | m |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | `ccofi_anchor_queue_alignment` | snapshot5_cross20_broad10 | 0.026103 | 0.535295 | 0.464705 | 0.940817 | +0.000075270 ([+0.000034283, +0.000116016]) | +0.000033623 | +0.000151384 | 0.131561 | 0.074240/0.009615/0.192383 | [IF](if) / [IH](ih) / [IC](ic) / [IM](im) |";
+    let (_, _, painted) = render_geometry(table, 640.0);
+    let clipped: Vec<_> = painted
+        .iter()
+        .filter(|entry| {
+            entry.rect.top() < entry.clip_rect.top() - 0.5
+                || entry.rect.bottom() > entry.clip_rect.bottom() + 0.5
+        })
+        .collect();
+    assert!(clipped.is_empty(), "{clipped:#?}");
+}
+
+#[test]
+#[cfg(feature = "math")]
+fn markdown_table_wraps_text_around_inline_math_without_clipping() {
+    let markdown = "\
+| Field | Requirement |
+|---|---|
+| value | PREFIX_MATH_TEXT with enough words to use the first line $\\frac{a+b}{c+d}$ TAIL_AFTER_MATH |
+
+AFTER_MATH_TABLE";
+    let (_, _, painted) = render_geometry(markdown, 300.0);
+
+    assert_text_fully_visible(&painted, "TAIL_AFTER_MATH");
+    assert_vertical_order(&painted, &["TAIL_AFTER_MATH", "AFTER_MATH_TABLE"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +486,7 @@ fn deep_scroll_keeps_content_extent_and_paints_visible_text() {
             let mut visible_text = 0;
             for clipped in output.shapes {
                 let mut painted = Vec::new();
-                collect_painted_text(&clipped.shape, &mut painted);
+                collect_painted_text(&clipped.shape, clipped.clip_rect, &mut painted);
                 visible_text += painted
                     .iter()
                     .filter(|text| text.rect.intersects(clipped.clip_rect))
