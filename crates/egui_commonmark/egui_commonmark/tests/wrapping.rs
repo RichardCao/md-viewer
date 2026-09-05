@@ -115,6 +115,44 @@ fn fitted_columns_do_not_split_short_header_words() {
     assert_eq!(required.rows, 1, "short header word was split: {required:?}");
 }
 
+#[test]
+fn markdown_table_uses_height_aware_column_widths() {
+    let markdown = "| Key | Description |\n|---|---|\n| A | ALPHA long prose that wraps over several lines and benefits from extra width in this column |\n| LongerKey | BETA another differently sized explanation that should determine the actual row maximum |";
+    let (body, _, painted) = render_geometry(markdown, 360.0);
+    let alpha = painted
+        .iter()
+        .find(|entry| entry.text.contains("ALPHA"))
+        .unwrap();
+
+    assert!(
+        body.height() < 145.0,
+        "height-aware layout was not applied: {body:?}"
+    );
+    assert!(
+        alpha.clip_rect.width() > 280.0,
+        "description column did not receive the spare width: {alpha:?}"
+    );
+}
+
+#[test]
+fn html_table_uses_height_aware_column_widths() {
+    let markdown = "<table><tr><th>Key</th><th>Description</th></tr><tr><td>A</td><td>ALPHA long prose that wraps over several lines and benefits from extra width in this column</td></tr><tr><td>LongerKey</td><td>BETA another differently sized explanation that should determine the actual row maximum</td></tr></table>";
+    let (body, _, painted) = render_geometry(markdown, 360.0);
+    let alpha = painted
+        .iter()
+        .find(|entry| entry.text.contains("ALPHA"))
+        .unwrap();
+
+    assert!(
+        body.height() < 170.0,
+        "height-aware layout was not applied: {body:?}"
+    );
+    assert!(
+        alpha.clip_rect.width() > 290.0,
+        "description column did not receive the spare width: {alpha:?}"
+    );
+}
+
 fn render(markdown: &str, width: f32) -> (Rect, f32) {
     let (body_rect, row_height, _) = render_geometry(markdown, width);
     (body_rect, row_height)
