@@ -1240,17 +1240,14 @@ fn register_existing_markdown_path(
 
 /// Check if a link destination points to a local markdown file
 fn is_local_markdown_link(destination: &str) -> bool {
-    if destination.starts_with("http://")
-        || destination.starts_with("https://")
-        || destination.starts_with("mailto:")
-        || destination.starts_with("tel:")
-        || destination.starts_with("ftp://")
-        || destination.starts_with('#')
-    {
+    if destination.starts_with('#') {
         return false;
     }
 
-    let path = if destination.starts_with("file://") {
+    let path = if let Some(scheme) = explicit_uri_scheme(destination) {
+        if !scheme.eq_ignore_ascii_case("file") {
+            return false;
+        }
         let Ok(url) = url::Url::parse(destination) else {
             return false;
         };
@@ -1269,10 +1266,36 @@ fn is_local_markdown_link(destination: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve a relative/absolute filesystem path or a `file://` URI against the
+/// Return an RFC 3986 URI scheme when the destination explicitly contains one.
+///
+/// Markdown link destinations are URIs, so a colon after a valid scheme prefix
+/// is not a filesystem separator. On Windows, preserve drive-letter paths such
+/// as `C:\docs\guide.md` instead of classifying `C` as a URI scheme.
+fn explicit_uri_scheme(destination: &str) -> Option<&str> {
+    let colon = destination.find(':')?;
+    let scheme = &destination[..colon];
+    let mut chars = scheme.chars();
+    if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    {
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    if scheme.len() == 1 {
+        return None;
+    }
+
+    Some(scheme)
+}
+
+/// Resolve a relative/absolute filesystem path or a `file:` URI against the
 /// directory containing the Markdown document.
 fn resolve_local_link_path(destination: &str, document_dir: &Path) -> Option<PathBuf> {
-    if destination.starts_with("file://") {
+    if let Some(scheme) = explicit_uri_scheme(destination) {
+        if !scheme.eq_ignore_ascii_case("file") {
+            return None;
+        }
         return url::Url::parse(destination).ok()?.to_file_path().ok();
     }
 
@@ -5691,6 +5714,60 @@ mod tests {
         assert_eq!(parse_local_links("`guide.md`", &document), ["guide.md"]);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_file_uris_are_classified_as_local_links() {
+        let document_dir = Path::new("/tmp/docs");
+        for destination in [
+            "data:text/plain,x.md",
+            "javascript:void(0)/x.md",
+            "unknownscheme://host/a.md",
+            "mailto:guide.md",
+        ] {
+            assert!(!is_local_markdown_link(destination), "{destination}");
+            assert_eq!(
+                resolve_local_link_path(destination, document_dir),
+                None,
+                "{destination}"
+            );
+        }
+
+        assert!(is_local_markdown_link("guide.md"));
+        assert!(is_local_markdown_link("docs%20with%20spaces/guide.md"));
+        assert_eq!(
+            resolve_local_link_path("100%done.md", document_dir),
+            Some(document_dir.join("100%done.md"))
+        );
+
+        let file_path = std::env::temp_dir().join("md-viewer-link-scheme-guide.md");
+        let file_uri = url::Url::from_file_path(&file_path).unwrap().to_string();
+        assert!(is_local_markdown_link(&file_uri));
+        assert_eq!(
+            resolve_local_link_path(&file_uri, document_dir),
+            Some(file_path)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_drive_prefixes_are_not_treated_as_uri_schemes() {
+        assert_eq!(explicit_uri_scheme(r"C:\docs\guide.md"), None);
+        assert_eq!(explicit_uri_scheme("D:/docs/guide.md"), None);
+        assert!(is_local_markdown_link(r"C:\docs\guide.md"));
+        assert!(is_local_markdown_link("D:/docs/guide.md"));
+    }
+
+    #[test]
+    fn explicit_non_file_schemes_are_not_registered_as_link_hooks() {
+        let document = Path::new("/tmp/index.md");
+        let content = concat!(
+            "[data](data:text/plain,x.md) ",
+            "[script](javascript:void(0)/x.md) ",
+            "[unknown](unknownscheme://host/a.md)",
+        );
+
+        assert!(parse_local_links(content, document).is_empty());
     }
 
     #[test]
